@@ -1,0 +1,27 @@
+{
+  "name": "form-kit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Routed contact form kit for small client sites: validation, spam checks, store-then-send delivery, retries, alerts, retention.",
+  "type": "module",
+  "packageManager": "pnpm@12.16.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "pnpm typecheck && pnpm test",
+    "live-test": "tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/live-test.ts"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16",
+    "@types/node": "^24.19.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}

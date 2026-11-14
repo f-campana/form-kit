@@ -11,6 +11,7 @@ import type {
   StoredSubmission,
   SubmissionStore,
 } from "./ports";
+import { referenceFor } from "./reference";
 import { checkFormToken, visitorKey } from "./spam";
 
 export interface ContactDeps {
@@ -36,7 +37,14 @@ export interface Visitor {
 }
 
 export type SubmitResult =
-  | { readonly status: "accepted"; readonly id?: string }
+  /** A honeypot submission gets this too, without an ID or a reference. */
+  | { readonly status: "accepted"; readonly id?: string; readonly reference?: string }
+  /**
+   * The form was sent too fast, or its token is missing, invalid or expired.
+   * The page asks the visitor to check their message and send it again, with a
+   * fresh token and the fields still filled in.
+   */
+  | { readonly status: "retry" }
   | { readonly status: "invalid"; readonly fieldErrors: Readonly<Record<string, string>> }
   | { readonly status: "rate_limited" }
   | { readonly status: "unavailable" };
@@ -44,8 +52,9 @@ export type SubmitResult =
 /**
  * Handles one submission, in the order pilot-spec.md §3 sets: spam checks,
  * server validation, rate limit, storage, then the first delivery attempt.
- * Suspected spam gets the same answer as a real submission, and nothing is
- * stored or sent for it.
+ * Only a honeypot submission gets the same answer as a real one; nothing is
+ * stored or sent for it. The token checks can catch real people, so they ask
+ * the visitor to try again.
  */
 export async function submitContact(
   config: ContactFormConfig,
@@ -61,10 +70,11 @@ export async function submitContact(
     deps.logger.info("submission_discarded", { why: "honeypot" });
     return { status: "accepted" };
   }
-  const token = await checkFormToken(deps.secret, input[config.spam.tokenField], now, config.spam.minFillMs);
+  const { tokenField, minFillMs, tokenMaxAgeMs } = config.spam;
+  const token = await checkFormToken(deps.secret, input[tokenField], now, minFillMs, tokenMaxAgeMs);
   if (token !== "ok") {
-    deps.logger.info("submission_discarded", { why: token });
-    return { status: "accepted" };
+    deps.logger.info("submission_refused", { why: token });
+    return { status: "retry" };
   }
 
   const parsed = parseSubmission(config, input);
@@ -83,8 +93,10 @@ export async function submitContact(
   }
 
   const pending: MessageState = { status: "pending", attempts: 0, nextAttemptAt: now.toISOString() };
+  const id = deps.newId();
   const record: StoredSubmission = {
-    id: deps.newId(),
+    id,
+    reference: await referenceFor(id),
     createdAt: now.toISOString(),
     reason: parsed.reason,
     data: parsed.data,
@@ -107,5 +119,5 @@ export async function submitContact(
   };
   if (deps.defer === undefined) await deliver();
   else deps.defer(deliver);
-  return { status: "accepted", id: record.id };
+  return { status: "accepted", id: record.id, reference: record.reference };
 }

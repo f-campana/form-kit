@@ -73,6 +73,8 @@ export interface MessageState {
 
 export interface StoredSubmission {
   readonly id: string;
+  /** What the visitor and the recipients quote. See `referenceFor`. */
+  readonly reference: string;
   readonly createdAt: string;
   readonly reason: string;
   /** Validated values only: the common fields and the chosen reason's fields. */

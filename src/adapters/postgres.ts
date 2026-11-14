@@ -12,6 +12,7 @@ export interface SqlClient {
 export const CONTACT_SCHEMA_SQL = `
 create table if not exists contact_submissions (
   id text primary key,
+  reference text not null,
   created_at timestamptz not null,
   reason text not null,
   data jsonb not null,
@@ -37,6 +38,7 @@ export async function migrateContactSchema(client: SqlClient): Promise<void> {
 
 interface SubmissionRow {
   id: string;
+  reference: string;
   created_at: Date | string;
   reason: string;
   data: Record<string, string>;
@@ -59,6 +61,7 @@ function nextDueAt(messages: StoredSubmission["messages"]): string | null {
 function toRecord(row: SubmissionRow): StoredSubmission {
   return {
     id: row.id,
+    reference: row.reference,
     createdAt: iso(row.created_at),
     reason: row.reason,
     data: row.data,
@@ -76,10 +79,11 @@ export function postgresStore(client: SqlClient): SubmissionStore {
   return {
     async insert(record) {
       await client.query(
-        `insert into contact_submissions (id, created_at, reason, data, messages, next_due_at, delivered_at)
-         values ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)`,
+        `insert into contact_submissions (id, reference, created_at, reason, data, messages, next_due_at, delivered_at)
+         values ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8)`,
         [
           record.id,
+          record.reference,
           record.createdAt,
           record.reason,
           JSON.stringify(record.data),
@@ -94,7 +98,7 @@ export function postgresStore(client: SqlClient): SubmissionStore {
       const { rows } = await client.query<SubmissionRow>(
         `update contact_submissions set locked_until = $3
          where id = $1 and (locked_until is null or locked_until <= $2)
-         returning id, created_at, reason, data, messages, delivered_at, locked_until`,
+         returning id, reference, created_at, reason, data, messages, delivered_at, locked_until`,
         [id, now.toISOString(), new Date(now.getTime() + leaseMs).toISOString()],
       );
       return rows[0] === undefined ? undefined : toRecord(rows[0]);

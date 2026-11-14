@@ -1,6 +1,7 @@
 /**
  * Spam checks that don't track visitors: a signed form token for the minimum
- * fill time, and a keyed hash of the visitor's address for the rate limit.
+ * fill time and the form's expiry, and a keyed hash of the visitor's address
+ * for the rate limit.
  * Uses Web Crypto only, so it runs on Node, Bun and edge runtimes alike.
  */
 
@@ -52,13 +53,14 @@ export async function issueFormToken(secret: string, now: Date): Promise<string>
   return `${issuedAt}.${await sign(secret, `form-token:${issuedAt}`)}`;
 }
 
-export type TokenCheck = "ok" | "too_fast" | "invalid";
+export type TokenCheck = "ok" | "too_fast" | "expired" | "invalid";
 
 export async function checkFormToken(
   secret: string,
   token: unknown,
   now: Date,
   minFillMs: number,
+  maxAgeMs: number,
 ): Promise<TokenCheck> {
   if (typeof token !== "string") return "invalid";
   const [issuedAt, signature, ...rest] = token.split(".");
@@ -74,7 +76,9 @@ export async function checkFormToken(
     encoder.encode(`form-token:${issuedAt}`),
   );
   if (!valid) return "invalid";
-  return now.getTime() - Number(issuedAt) < minFillMs ? "too_fast" : "ok";
+  const age = now.getTime() - Number(issuedAt);
+  if (age < minFillMs) return "too_fast";
+  return age >= maxAgeMs ? "expired" : "ok";
 }
 
 /**

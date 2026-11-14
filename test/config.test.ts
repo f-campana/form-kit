@@ -22,7 +22,8 @@ function input(overrides: Partial<ContactFormInput> = {}): ContactFormInput {
 describe("defineContactForm: the deploy fails on a bad routing table", () => {
   it("accepts the cabinetmaker's configuration", () => {
     expect(atelierContact.reasons["devis"]?.to).toBe("fondateur");
-    expect(atelierContact.retentionDays).toBe(30);
+    expect(atelierContact.retentionDays).toBe(7);
+    expect(atelierContact.spam.tokenMaxAgeMs).toBe(24 * 60 * 60_000);
   });
 
   it("fails when a reason goes to a role with no recipient list", () => {

@@ -55,6 +55,7 @@ export function notificationEmail(config: ContactFormConfig, record: StoredSubmi
     subject: oneLine(`${reason.label} — ${name}`),
     text: [
       `Nouveau message envoyé depuis le site ${config.siteName}.`,
+      `Référence${COLON} ${record.reference}`,
       "",
       summary(config, reason, record),
       "",
@@ -63,23 +64,25 @@ export function notificationEmail(config: ContactFormConfig, record: StoredSubmi
   };
 }
 
-/** The copy sent to the visitor. It contains only what they sent, nothing internal. */
+/**
+ * The acknowledgement sent to the visitor. It contains nothing they typed, not
+ * even their name: a confirmation that echoed visitor text could be used to
+ * send spam to any address through the form.
+ */
 export function confirmationEmail(config: ContactFormConfig, record: StoredSubmission): OutgoingEmail {
   const reason = reasonOf(config, record);
-  const name = record.data["name"] ?? "";
   return {
     from: config.from,
     to: [record.data["email"] ?? ""],
     ...(config.confirmationReplyTo === undefined ? {} : { replyTo: config.confirmationReplyTo }),
     subject: oneLine(`Votre message à ${config.siteName}`),
     text: [
-      `Bonjour ${name},`,
+      "Bonjour,",
       "",
       `Merci pour votre message. ${config.nextSteps}`,
       "",
-      `Voici une copie de ce que vous nous avez envoyé${COLON}`,
-      "",
-      summary(config, reason, record),
+      `Référence${COLON} ${record.reference}`,
+      `Motif${COLON} ${reason.label}`,
       "",
       config.siteName,
     ].join("\n"),

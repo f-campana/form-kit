@@ -39,6 +39,7 @@ const at = (minutes: number) => new Date(START.getTime() + minutes * MINUTE);
 function record(overrides: Partial<StoredSubmission> = {}): StoredSubmission {
   return {
     id: "sub-1",
+    reference: "7K3F9QXM",
     createdAt: START.toISOString(),
     reason: "autre",
     data: { name: "Camille", email: "camille@example.org", message: "Bonjour\nà vous" },
@@ -115,13 +116,13 @@ describe.each(stores)("%s store: the contract the kit relies on", (_name, make) 
 });
 
 describe("the whole flow on Postgres", () => {
-  it("stores, retries through an outage, delivers once, and purges after 30 days", async () => {
+  it("stores, retries through an outage, delivers once, and purges after 7 days", async () => {
     const db = await freshDatabase();
     const { deps, clock, mail, alerts } = setup({ failWhen: () => true });
     const pgDeps = { ...deps, store: postgresStore(db), rateLimiter: postgresRateLimiter(db) };
 
     const result = await submitContact(config, pgDeps, await submission("devis", clock.now()), { address: "203.0.113.7" });
-    expect(result).toEqual({ status: "accepted", id: "sub-1" });
+    expect(result).toMatchObject({ status: "accepted", id: "sub-1" });
 
     mail.failWhen(() => false);
     clock.advance(5 * MINUTE);
@@ -132,7 +133,7 @@ describe("the whole flow on Postgres", () => {
     const { rows } = await db.query<{ key: string }>("select key from contact_rate_hits");
     expect(rows.map((row) => row.key).join(" ")).not.toContain("203.0.113.7");
 
-    clock.advance(30 * DAY);
+    clock.advance(7 * DAY);
     expect(await purgeDelivered(config, pgDeps)).toBe(1);
   });
 });

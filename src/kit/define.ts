@@ -16,8 +16,10 @@ export interface SpamSettings {
   readonly honeypotField: string;
   /** The field carrying the server-signed time the form was shown. */
   readonly tokenField: string;
-  /** Faster than this, a submission is treated as spam. */
+  /** Faster than this, the visitor is asked to send the form again. */
   readonly minFillMs: number;
+  /** A form left open longer than this must be sent again, so a collected token can't be used forever. */
+  readonly tokenMaxAgeMs: number;
   readonly rateLimitMax: number;
   readonly rateLimitWindowMs: number;
 }
@@ -65,6 +67,7 @@ export const DEFAULT_SPAM: SpamSettings = {
   honeypotField: "website",
   tokenField: "formToken",
   minFillMs: 3_000,
+  tokenMaxAgeMs: 24 * 60 * 60_000,
   rateLimitMax: 5,
   rateLimitWindowMs: 60 * 60_000,
 };
@@ -95,7 +98,7 @@ export function defineContactForm(input: ContactFormInput): ContactFormConfig {
     reasonError: input.reasonError ?? "Choisissez le motif de votre message.",
     spam: { ...DEFAULT_SPAM, ...input.spam },
     delivery: { ...DEFAULT_DELIVERY, ...input.delivery },
-    retentionDays: input.retentionDays ?? 30,
+    retentionDays: input.retentionDays ?? 7,
   };
   const problems = findProblems(config);
   if (problems.length > 0) throw new ContactConfigError(problems);
@@ -166,6 +169,9 @@ function findProblems(config: ContactFormConfig): string[] {
   if (!(leaseMs > 0)) problems.push("delivery.leaseMs must be more than zero");
   if (!(config.retentionDays > 0)) problems.push("retentionDays must be more than zero");
   if (!(config.spam.minFillMs >= 0)) problems.push("spam.minFillMs must be zero or more");
+  if (!(config.spam.tokenMaxAgeMs > config.spam.minFillMs)) {
+    problems.push("spam.tokenMaxAgeMs must be more than spam.minFillMs");
+  }
   if (!(config.spam.rateLimitMax >= 1)) problems.push("spam.rateLimitMax must be at least 1");
   if (!(config.spam.rateLimitWindowMs > 0)) problems.push("spam.rateLimitWindowMs must be more than zero");
 

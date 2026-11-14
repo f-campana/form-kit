@@ -3,26 +3,34 @@ import { atelierContact as config } from "../src/example/atelier-contact";
 import { checkFormToken, issueFormToken, parseSubmission, visitorKey } from "../src/kit";
 import { SECRET, START } from "./support";
 
+const DAY_MS = 24 * 60 * 60_000;
+
 describe("form token", () => {
   const at = (ms: number) => new Date(START.getTime() + ms);
 
   it("passes once the minimum fill time has gone by, and not before", async () => {
     const token = await issueFormToken(SECRET, START);
-    expect(await checkFormToken(SECRET, token, at(3_000), 3_000)).toBe("ok");
-    expect(await checkFormToken(SECRET, token, at(2_999), 3_000)).toBe("too_fast");
+    expect(await checkFormToken(SECRET, token, at(3_000), 3_000, DAY_MS)).toBe("ok");
+    expect(await checkFormToken(SECRET, token, at(2_999), 3_000, DAY_MS)).toBe("too_fast");
+  });
+
+  it("expires 24 hours after it was issued", async () => {
+    const token = await issueFormToken(SECRET, START);
+    expect(await checkFormToken(SECRET, token, at(DAY_MS - 1), 3_000, DAY_MS)).toBe("ok");
+    expect(await checkFormToken(SECRET, token, at(DAY_MS), 3_000, DAY_MS)).toBe("expired");
   });
 
   it("rejects a token signed with another secret, or with an edited time", async () => {
     const token = await issueFormToken(SECRET, START);
     const signature = token.split(".")[1];
-    expect(await checkFormToken("another-secret-of-at-least-32-characters", token, at(60_000), 3_000)).toBe("invalid");
-    expect(await checkFormToken(SECRET, `${START.getTime() - 3_600_000}.${signature}`, at(60_000), 3_000)).toBe("invalid");
+    expect(await checkFormToken("another-secret-of-at-least-32-characters", token, at(60_000), 3_000, DAY_MS)).toBe("invalid");
+    expect(await checkFormToken(SECRET, `${START.getTime() - 3_600_000}.${signature}`, at(60_000), 3_000, DAY_MS)).toBe("invalid");
   });
 
   it.each([undefined, 42, "", "123", "123.", ".abc", "123.abc.def", "abc.def", "123.a+b/c="])(
     "rejects %s",
     async (token) => {
-      expect(await checkFormToken(SECRET, token, at(60_000), 3_000)).toBe("invalid");
+      expect(await checkFormToken(SECRET, token, at(60_000), 3_000, DAY_MS)).toBe("invalid");
     },
   );
 });

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { atelierContact as config } from "../src/example/atelier-contact";
-import { checkFormToken, issueFormToken, parseSubmission, visitorKey } from "../src/kit";
-import { SECRET, START } from "./support";
+import { checkFormToken, formTokenId, issueFormToken, parseSubmission, visitorKey } from "../src/kit";
+import { respelled, SECRET, START } from "./support";
 
 const DAY_MS = 24 * 60 * 60_000;
 
@@ -20,14 +20,31 @@ describe("form token", () => {
     expect(await checkFormToken(SECRET, token, at(DAY_MS), 3_000, DAY_MS)).toBe("expired");
   });
 
-  it("rejects a token signed with another secret, or with an edited time", async () => {
-    const token = await issueFormToken(SECRET, START);
-    const signature = token.split(".")[1];
-    expect(await checkFormToken("another-secret-of-at-least-32-characters", token, at(60_000), 3_000, DAY_MS)).toBe("invalid");
-    expect(await checkFormToken(SECRET, `${START.getTime() - 3_600_000}.${signature}`, at(60_000), 3_000, DAY_MS)).toBe("invalid");
+  it("is different every time, even when issued at the same moment", async () => {
+    const [first, second] = await Promise.all([issueFormToken(SECRET, START), issueFormToken(SECRET, START)]);
+    expect(first).not.toBe(second);
+    expect(await formTokenId(first)).not.toBe(await formTokenId(second));
+    expect(await formTokenId(first)).toBe(await formTokenId(first));
+    expect(await formTokenId(first)).not.toContain(first.split(".")[1]);
   });
 
-  it.each([undefined, 42, "", "123", "123.", ".abc", "123.abc.def", "abc.def", "123.a+b/c="])(
+  it("counts as the same token when its signature is spelled differently", async () => {
+    const token = await issueFormToken(SECRET, START);
+    const variant = respelled(token);
+    expect(variant).not.toBe(token);
+    if ((await checkFormToken(SECRET, variant, at(60_000), 3_000, DAY_MS)) === "ok") {
+      expect(await formTokenId(variant)).toBe(await formTokenId(token));
+    }
+  });
+
+  it("rejects a token signed with another secret, or with an edited time", async () => {
+    const token = await issueFormToken(SECRET, START);
+    const [, nonce, signature] = token.split(".");
+    expect(await checkFormToken("another-secret-of-at-least-32-characters", token, at(60_000), 3_000, DAY_MS)).toBe("invalid");
+    expect(await checkFormToken(SECRET, `${START.getTime() - 3_600_000}.${nonce}.${signature}`, at(60_000), 3_000, DAY_MS)).toBe("invalid");
+  });
+
+  it.each([undefined, 42, "", "123", "123.", ".abc", "123.abc", "123.abc.def", "123.abc.def.ghi", "abc.def.ghi", "123.abc.a+b/c="])(
     "rejects %s",
     async (token) => {
       expect(await checkFormToken(SECRET, token, at(60_000), 3_000, DAY_MS)).toBe("invalid");

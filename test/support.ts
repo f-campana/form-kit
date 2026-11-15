@@ -97,6 +97,17 @@ export function setup(options: { failWhen?: FailWhen; failWith?: () => Error } =
   return { deps, clock, store, mail, alerts, logs: lines, rateLimiter };
 }
 
+const BASE64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/**
+ * The same token written differently: the signature's last character carries
+ * two unused bits, so changing them gives a string that still verifies.
+ */
+export function respelled(token: string): string {
+  const last = BASE64URL.indexOf(token.slice(-1));
+  return token.slice(0, -1) + BASE64URL[last ^ 1];
+}
+
 export const REASONS = ["devis", "visite", "suivi", "autre"] as const;
 export type Reason = (typeof REASONS)[number];
 

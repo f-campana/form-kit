@@ -75,6 +75,10 @@ export interface StoredSubmission {
   readonly id: string;
   /** What the visitor and the recipients quote. See `referenceFor`. */
   readonly reference: string;
+  /** A hash of the form token that carried it. Each token stores one submission. See `formTokenId`. */
+  readonly tokenId: string;
+  /** Identifies what the visitor sent. See `contentFingerprint`. */
+  readonly fingerprint: string;
   readonly createdAt: string;
   readonly reason: string;
   /** Validated values only: the common fields and the chosen reason's fields. */
@@ -86,9 +90,28 @@ export interface StoredSubmission {
   lockedUntil?: string;
 }
 
+/** The submission a form token already stored. */
+export interface TokenHolder {
+  readonly id: string;
+  readonly reference: string;
+  readonly fingerprint: string;
+}
+
+export type InsertOutcome =
+  | { readonly stored: true }
+  /** The record's token was already used. `existing` is the submission that holds it, if it's still there. */
+  | { readonly stored: false; readonly existing?: TokenHolder };
+
 export interface SubmissionStore {
-  /** Saves a new submission. Throws if it can't, and then nothing is sent. */
-  insert(record: StoredSubmission): Promise<void>;
+  /**
+   * Saves a new submission, unless its form token already stored one. Checking
+   * the token and saving must be one atomic step: of several inserts with the
+   * same token, exactly one is stored. Throws if it can't save, and then
+   * nothing is sent.
+   */
+  insert(record: StoredSubmission): Promise<InsertOutcome>;
+  /** The submission a form token already stored, if any. */
+  findByToken(tokenId: string): Promise<TokenHolder | undefined>;
   /**
    * Takes the delivery lease if it's free or expired, and returns a copy of the
    * record. Returns undefined if another run holds it, or the record is gone.
@@ -104,6 +127,11 @@ export interface SubmissionStore {
 
 /** Counts submissions per hashed visitor key over a sliding window. */
 export interface RateLimiter {
-  /** Records a hit and returns true, or returns false if the visitor is over the limit. */
-  hit(key: string, now: Date, windowMs: number, max: number): Promise<boolean>;
+  /**
+   * Records a hit and returns true, or returns false if the visitor is over the
+   * limit. `formId` identifies the form being sent (its token ID): one form
+   * counts once and is always let through again, however many times it
+   * arrives, including several times at the same moment.
+   */
+  hit(key: string, now: Date, windowMs: number, max: number, formId: string): Promise<boolean>;
 }

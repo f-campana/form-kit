@@ -8,7 +8,7 @@ import {
   purgeDelivered,
   submitContact,
 } from "../src/kit";
-import { DAY, MINUTE, REASON_VALUES, REASONS, SECRET, setup, submission, VISITOR } from "./support";
+import { DAY, MINUTE, REASON_VALUES, REASONS, respelled, SECRET, setup, submission, VISITOR } from "./support";
 
 // Written from pilot-spec.md §3, independently of the implementation.
 /** Eight characters, without the look-alikes 0, O, 1, I, L and U. */
@@ -237,6 +237,120 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
     expect(tooLate).toEqual({ status: "retry" });
     expect(store.records.size).toBe(1);
     expect(mail.sent).toHaveLength(2);
+  });
+
+  describe("a form token can be used once", () => {
+    it("sends one notification and one confirmation for a double click", async () => {
+      const { deps, clock, mail, store } = setup();
+      const form = await submission("devis", clock.now());
+
+      const first = await submitContact(config, deps, form);
+      const second = await submitContact(config, deps, form);
+
+      expect(first).toEqual({ status: "accepted", id: "sub-1", reference: REFERENCE });
+      expect(second).toEqual(first);
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2);
+    });
+
+    it("stores one submission when two identical requests arrive together", async () => {
+      const { deps, clock, mail, store } = setup();
+      const form = await submission("devis", clock.now());
+
+      const [first, second] = await Promise.all([submitContact(config, deps, form), submitContact(config, deps, form)]);
+
+      expect(first).toMatchObject({ status: "accepted", reference: REFERENCE });
+      expect(second).toEqual(first);
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2);
+    });
+
+    it("gives the same reference again when the visitor resends after a lost response", async () => {
+      // The provider is down, so the first attempt has failed and a retry is scheduled.
+      const { deps, clock, mail, store, alerts } = setup({ failWhen: () => true });
+      const form = await submission("devis", clock.now());
+      const first = await submitContact(config, deps, form);
+      expect(mail.attempts).toHaveLength(2);
+
+      clock.advance(2 * MINUTE);
+      const again = await submitContact(config, deps, form);
+
+      expect(again).toEqual(first);
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2); // the resend sends nothing; the scheduled retry will
+      expect(alerts).toEqual([]);
+    });
+
+    it("asks the visitor to try again when a used token comes back with different content", async () => {
+      const { deps, clock, mail, store } = setup();
+      const form = await submission("autre", clock.now());
+      await submitContact(config, deps, form);
+
+      const edited = await submitContact(config, deps, { ...form, message: "Un tout autre message." });
+
+      expect(edited).toEqual({ status: "retry" });
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2);
+    });
+
+    it("can't be used a second time by respelling its signature", async () => {
+      const { deps, clock, mail, store } = setup();
+      const form = await submission("autre", clock.now());
+      const first = await submitContact(config, deps, form);
+
+      const respelt = { ...form, formToken: respelled(String(form["formToken"])) };
+      const same = await submitContact(config, deps, respelt);
+      const edited = await submitContact(config, deps, { ...respelt, message: "Un tout autre message." });
+
+      expect(same).toEqual(first);
+      expect(edited).toEqual({ status: "retry" });
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2);
+    });
+
+    it("doesn't count resends of the same form against the visitor's rate limit", async () => {
+      const { deps, clock, store } = setup();
+      const visitor = { address: "203.0.113.7" };
+      const form = await submission("autre", clock.now());
+
+      for (let i = 0; i < 8; i += 1) {
+        expect(await submitContact(config, deps, form, visitor)).toMatchObject({ status: "accepted", id: "sub-1" });
+      }
+      expect(await submitContact(config, deps, await submission("autre", clock.now()), visitor)).toMatchObject({
+        status: "accepted",
+        id: "sub-2",
+      });
+      expect(store.records.size).toBe(2);
+    });
+
+    it("gives both of two identical requests the same answer, even at the visitor's rate limit", async () => {
+      const { deps, clock, mail, store } = setup();
+      const oneAnHour = { ...config, spam: { ...config.spam, rateLimitMax: 1 } };
+      const visitor = { address: "203.0.113.7" };
+      const form = await submission("devis", clock.now());
+
+      const [first, second] = await Promise.all([
+        submitContact(oneAnHour, deps, form, visitor),
+        submitContact(oneAnHour, deps, form, visitor),
+      ]);
+
+      expect(first).toMatchObject({ status: "accepted", reference: REFERENCE });
+      expect(second).toEqual(first);
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2);
+      // The limit still holds for a different form.
+      const another = await submitContact(oneAnHour, deps, await submission("devis", clock.now()), visitor);
+      expect(another).toEqual({ status: "rate_limited" });
+    });
+
+    it("keeps the token itself out of the store", async () => {
+      const { deps, clock, store } = setup();
+      const form = await submission("autre", clock.now());
+
+      await submitContact(config, deps, form);
+
+      expect(JSON.stringify([...store.records.values()])).not.toContain(String(form["formToken"]));
+    });
   });
 
   it("shows success only once the submission is stored", async () => {

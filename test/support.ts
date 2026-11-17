@@ -3,9 +3,9 @@ import {
   MailerError,
   memoryRateLimiter,
   memoryStore,
+  type Alert,
   type Alerter,
   type ContactDeps,
-  type DeliveryAlert,
   type Logger,
   type Mailer,
   type OutgoingEmail,
@@ -15,6 +15,9 @@ export const SECRET = "test-secret-that-is-at-least-32-characters-long";
 export const START = new Date("2026-11-11T09:00:00.000Z");
 export const MINUTE = 60_000;
 export const DAY = 24 * 60 * MINUTE;
+
+/** Where alerts go: the developer's verified address, from a verified sender. */
+export const ALERTS = { from: "alertes@example.test", to: ["fabien@example.test"] };
 
 export function manualClock(start = START) {
   let current = start.getTime();
@@ -56,14 +59,23 @@ export function fakeMailer(
   };
 }
 
+/** Records the alerts that go out. While `failing()` is true, alerts fail and aren't recorded. */
 export function recordingAlerter() {
-  const alerts: DeliveryAlert[] = [];
+  const alerts: Alert[] = [];
+  let failing = false;
   const alerter: Alerter = {
     async alert(alert) {
+      if (failing) throw new MailerError("alert_channel_down");
       alerts.push(alert);
     },
   };
-  return { alerter, alerts };
+  return {
+    alerter,
+    alerts,
+    fail(next: boolean) {
+      failing = next;
+    },
+  };
 }
 
 export function recordingLogger() {
@@ -80,7 +92,7 @@ export function setup(options: { failWhen?: FailWhen; failWith?: () => Error } =
   const clock = manualClock();
   const store = memoryStore();
   const mail = fakeMailer(options.failWhen, options.failWith);
-  const { alerter, alerts } = recordingAlerter();
+  const { alerter, alerts, fail: failAlerts } = recordingAlerter();
   const { logger, lines } = recordingLogger();
   const rateLimiter = memoryRateLimiter();
   let next = 0;
@@ -94,7 +106,7 @@ export function setup(options: { failWhen?: FailWhen; failWith?: () => Error } =
     secret: SECRET,
     newId: () => `sub-${++next}`,
   };
-  return { deps, clock, store, mail, alerts, logs: lines, rateLimiter };
+  return { deps, clock, store, mail, alerts, failAlerts, logs: lines, rateLimiter };
 }
 
 const BASE64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

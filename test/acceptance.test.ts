@@ -14,6 +14,17 @@ import { DAY, MINUTE, REASON_VALUES, REASONS, respelled, SECRET, setup, submissi
 /** Eight characters, without the look-alikes 0, O, 1, I, L and U. */
 const REFERENCE = expect.stringMatching(/^[2-9A-HJKMNP-TV-Z]{8}$/);
 
+/** The alert for a message that failed for good: the site, the reference and the error, no visitor data. */
+const failedAlert = (message: string, attempts: number, lastError: string) => ({
+  kind: "delivery_failed",
+  site: config.siteName,
+  submissionId: "sub-1",
+  reference: REFERENCE,
+  message,
+  attempts,
+  lastError,
+});
+
 const EXPECTED_RECIPIENTS = {
   devis: ["fondateur@example.test"],
   visite: ["fondateur@example.test"],
@@ -125,8 +136,8 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
       await processDue(config, deps);
       expect(mail.attempts).toHaveLength(6); // third and last attempt, 35 minutes in
       expect(alerts).toEqual([
-        { submissionId: "sub-1", message: "notification", attempts: 3, lastError: "provider_unavailable" },
-        { submissionId: "sub-1", message: "confirmation", attempts: 3, lastError: "provider_unavailable" },
+        failedAlert("notification", 3, "provider_unavailable"),
+        failedAlert("confirmation", 3, "provider_unavailable"),
       ]);
 
       clock.advance(DAY);
@@ -160,7 +171,7 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
 
       await submitContact(config, deps, await submission("devis", clock.now()));
       expect(alerts).toEqual([
-        { submissionId: "sub-1", message: "notification", attempts: 1, lastError: "rejected_400" },
+        failedAlert("notification", 1, "rejected_400"),
       ]);
 
       clock.advance(DAY);
@@ -180,7 +191,7 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
       expect(mail.sent.map((email) => email.to)).toEqual([["atelier@example.test"]]);
       expect(mail.attempts).toHaveLength(4); // one notification, three confirmation attempts
       expect(alerts).toEqual([
-        { submissionId: "sub-1", message: "confirmation", attempts: 3, lastError: "provider_unavailable" },
+        failedAlert("confirmation", 3, "provider_unavailable"),
       ]);
     });
   });

@@ -16,6 +16,10 @@ import {
 } from "../src/kit";
 import { DAY, MINUTE, setup, START, submission, VISITOR } from "./support";
 
+const SENT = { status: "sent", attempts: 1, sentAt: START.toISOString() } as const;
+/** A message that failed for good, whose alert hasn't gone out. */
+const UNALERTED = { status: "failed", attempts: 1, lastError: "rejected_400" } as const;
+
 /** A fresh in-process Postgres with the kit's tables. */
 async function freshDatabase(): Promise<SqlClient> {
   const db = new PGlite();
@@ -102,13 +106,51 @@ describe.each(stores)("%s store: the contract the kit relies on", (_name, make) 
 
   it("deletes only submissions delivered before the cutoff", async () => {
     const { store } = await make();
-    await store.insert(record({ deliveredAt: at(0).toISOString() }));
-    await store.insert(record({ id: "sub-2", deliveredAt: at(10).toISOString() }));
+    const delivered = { notification: SENT, confirmation: SENT };
+    await store.insert(record({ messages: delivered, deliveredAt: at(0).toISOString() }));
+    await store.insert(record({ id: "sub-2", messages: delivered, deliveredAt: at(10).toISOString() }));
     await store.insert(record({ id: "sub-3" }));
 
     expect(await store.deleteDeliveredBefore(at(5))).toBe(1);
     expect(await store.claim("sub-1", at(5), MINUTE)).toBeUndefined();
+    expect(await store.claim("sub-2", at(5), MINUTE)).toBeDefined();
     expect(await store.claim("sub-3", at(5), MINUTE)).toBeDefined();
+  });
+
+  it("deletes only the visitor's data while an alert is waiting, then the rest once it has gone out", async () => {
+    const { store } = await make();
+    await store.insert(record({ messages: { notification: SENT, confirmation: UNALERTED }, deliveredAt: at(0).toISOString() }));
+
+    expect(await store.deleteDeliveredBefore(at(5))).toBe(1);
+    expect(await store.deleteDeliveredBefore(at(5))).toBe(0);
+    expect(await store.listDue(at(5))).toEqual(["sub-1"]);
+    const kept = (await store.claim("sub-1", at(5), MINUTE))!;
+    expect(kept).toMatchObject({ id: "sub-1", reference: "7K3F9QXM", reason: "", data: {}, fingerprint: "" });
+
+    await store.release({ ...kept, messages: { ...kept.messages, confirmation: { ...UNALERTED, alertedAt: at(5).toISOString() } } });
+    expect(await store.listDue(at(5))).toEqual([]);
+    expect(await store.deleteDeliveredBefore(at(5))).toBe(1);
+    expect(await store.claim("sub-1", at(5), MINUTE)).toBeUndefined();
+  });
+
+  it("never undoes a purge that ran while a run held the lease", async () => {
+    const { store } = await make();
+    const waiting = { notification: SENT, confirmation: UNALERTED };
+    await store.insert(record({ messages: waiting, deliveredAt: at(0).toISOString() }));
+    await store.insert(record({ id: "sub-2", messages: { notification: SENT, confirmation: SENT }, deliveredAt: at(0).toISOString() }));
+
+    const emptiedLater = (await store.claim("sub-1", at(5), MINUTE))!;
+    const deletedLater = (await store.claim("sub-2", at(5), MINUTE))!;
+    expect(await store.deleteDeliveredBefore(at(5))).toBe(2);
+    await store.release({ ...emptiedLater, messages: { ...waiting, confirmation: { ...UNALERTED, alertedAt: at(5).toISOString() } } });
+    await store.release(deletedLater);
+
+    const kept = (await store.claim("sub-1", at(10), MINUTE))!;
+    expect(kept).toMatchObject({ reason: "", data: {}, fingerprint: "" });
+    expect(kept.messages.confirmation.alertedAt).toBe(at(5).toISOString());
+    expect(JSON.stringify(kept)).not.toContain("camille");
+    expect(await store.claim("sub-2", at(10), MINUTE)).toBeUndefined();
+    expect(await store.findByToken("token-of-sub-2")).toBeUndefined();
   });
 
   it("rejects a duplicate ID", async () => {
@@ -201,14 +243,39 @@ describe("upgrading a database created by the first version", () => {
     );
     await db.query(`insert into contact_rate_hits (key, hit_at) values ('visitor-a', $1)`, [START.toISOString()]);
 
+    // Failed before alerts were tracked, so whether their alert went out is unknown:
+    // one with nothing else to do, one whose other message waits for a retry an hour later.
+    const failedOnly = record({ id: "old-2", messages: { notification: UNALERTED, confirmation: SENT } });
+    const failedAndWaiting = record({
+      id: "old-3",
+      messages: { notification: SENT, confirmation: { ...UNALERTED, lastError: "provider_503" } },
+    });
+    failedAndWaiting.messages.notification = { status: "pending", attempts: 1, nextAttemptAt: at(60).toISOString() };
+    for (const [old, nextDue] of [[failedOnly, null], [failedAndWaiting, at(60).toISOString()]] as const) {
+      await db.query(
+        `insert into contact_submissions (id, created_at, reason, data, messages, next_due_at) values ($1, $2, $3, $4::jsonb, $5::jsonb, $6)`,
+        [old.id, old.createdAt, old.reason, JSON.stringify(old.data), JSON.stringify(old.messages), nextDue],
+      );
+    }
+
     await migrateContactSchema(db);
     await migrateContactSchema(db); // upgrading twice must be harmless
 
-    const { deps, mail } = setup();
+    const { deps, mail, alerts } = setup();
     const pgDeps = { ...deps, store: postgresStore(db), rateLimiter: postgresRateLimiter(db) };
-    expect(await pgDeps.store.listDue(at(0))).toEqual(["old-1"]);
+    expect((await pgDeps.store.listDue(at(0))).sort()).toEqual(["old-1", "old-2", "old-3"]);
     await processDue(config, pgDeps);
     expect(mail.sent.map((email) => email.to)).toEqual([["atelier@example.test"], ["camille@example.org"]]);
+    // The old alerts are sent again, once each, and the waiting retry keeps its time.
+    expect(alerts.map((alert) => alert.kind === "delivery_failed" && [alert.submissionId, alert.message]).sort()).toEqual([
+      ["old-2", "notification"],
+      ["old-3", "confirmation"],
+    ]);
+    await migrateContactSchema(db);
+    expect(await pgDeps.store.listDue(at(0))).toEqual([]);
+    expect(await pgDeps.store.listDue(at(60))).toEqual(["old-3"]);
+    await processDue(config, pgDeps);
+    expect(alerts).toHaveLength(2);
     expect(mail.sent[0]?.text).toMatch(/Référence\u00a0: [2-9A-HJKMNP-TV-Z]{8}\n/);
 
     // New submissions and the rate limit work on the upgraded tables.
@@ -219,6 +286,25 @@ describe("upgrading a database created by the first version", () => {
 });
 
 describe("the whole flow on Postgres", () => {
+  it("keeps sending other messages while more than 100 alerts keep failing", async () => {
+    const db = await freshDatabase();
+    const { deps, mail, failAlerts } = setup();
+    const store = postgresStore(db);
+    const pgDeps = { ...deps, store };
+    failAlerts(true);
+    for (let i = 1; i <= 150; i += 1) {
+      await store.insert(record({ id: `failed-${i}`, messages: { notification: UNALERTED, confirmation: SENT } }));
+    }
+    await store.insert(record({ id: "waiting", messages: { notification: SENT, confirmation: record().messages.confirmation } }));
+
+    // Each run takes 100; failed alerts move back, so the waiting message gets its turn by the second run.
+    expect(await processDue(config, pgDeps)).toBe(100);
+    expect(mail.sent).toEqual([]);
+    expect(await processDue(config, pgDeps)).toBe(51);
+    expect(mail.sent.map((email) => email.to)).toEqual([["camille@example.org"]]);
+    expect(await store.listDue(deps.clock.now())).toEqual([]);
+  });
+
   it("stores, retries through an outage, delivers once, and purges after 7 days", async () => {
     const db = await freshDatabase();
     const { deps, clock, mail, alerts } = setup({ failWhen: () => true });

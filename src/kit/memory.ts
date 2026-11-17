@@ -1,16 +1,12 @@
+import { alertPending, needsWork } from "./due";
 import type {
   Clock,
   Logger,
-  MessageState,
   RateLimiter,
   StoredSubmission,
   SubmissionStore,
   TokenHolder,
 } from "./ports";
-
-const isDue = (state: MessageState, now: Date) =>
-  state.status === "pending" &&
-  (state.nextAttemptAt === undefined || Date.parse(state.nextAttemptAt) <= now.getTime());
 
 /**
  * Keeps submissions in memory. For tests and local runs only: everything is
@@ -47,19 +43,29 @@ export function memoryStore(): SubmissionStore & {
       return structuredClone(record);
     },
     async release(record) {
-      const { lockedUntil: _released, ...rest } = record;
-      records.set(record.id, structuredClone(rest));
+      const stored = records.get(record.id);
+      if (stored === undefined) return;
+      const { lockedUntil: _released, ...rest } = stored;
+      records.set(record.id, {
+        ...rest,
+        messages: structuredClone(record.messages),
+        ...(record.deliveredAt === undefined ? {} : { deliveredAt: record.deliveredAt }),
+      });
     },
     async listDue(now) {
       return [...records.values()]
-        .filter((record) => Object.values(record.messages).some((state) => isDue(state, now)))
+        .filter((record) => Object.values(record.messages).some((state) => needsWork(state, now)))
         .map((record) => record.id);
     },
     async deleteDeliveredBefore(cutoff) {
       let count = 0;
       for (const [id, record] of records) {
-        if (record.deliveredAt !== undefined && Date.parse(record.deliveredAt) <= cutoff.getTime()) {
+        if (record.deliveredAt === undefined || Date.parse(record.deliveredAt) > cutoff.getTime()) continue;
+        if (!Object.values(record.messages).some(alertPending)) {
           records.delete(id);
+          count += 1;
+        } else if (Object.keys(record.data).length > 0) {
+          records.set(id, { ...record, reason: "", data: {}, fingerprint: "" });
           count += 1;
         }
       }

@@ -1,6 +1,7 @@
 import {
+  alertPending,
+  nextDueAt,
   referenceFor,
-  type MessageState,
   type RateLimiter,
   type StoredSubmission,
   type SubmissionStore,
@@ -107,6 +108,22 @@ export async function migrateContactSchema(client: SqlClient, options: PostgresO
   }
 
   for (const statement of constraintsSql(names)) await client.query(statement);
+
+  // Earlier versions tried each alert once, when a message failed, and
+  // recorded neither success nor failure, so whether those alerts reached
+  // anyone is unknown. They are treated as not sent: the upgrade makes them
+  // due, and the worker sends them. An alert sent twice is better than one
+  // never sent, and alerts carry no visitor data. Each row's due time is
+  // recomputed, whether or not another message of it is still pending.
+  const failed = await client.query<{ id: string; messages: StoredSubmission["messages"]; next_due_at: Date | string | null }>(
+    `select id, messages, next_due_at from ${names.submissions} where messages::text like '%"failed"%'`,
+  );
+  for (const { id, messages, next_due_at } of failed.rows) {
+    if (!Object.values(messages).some(alertPending)) continue;
+    const due = nextDueAt(messages);
+    if (next_due_at !== null && due !== null && iso(next_due_at) === due) continue;
+    await client.query(`update ${names.submissions} set next_due_at = $2 where id = $1`, [id, due]);
+  }
 }
 
 interface SubmissionRow {
@@ -123,15 +140,6 @@ interface SubmissionRow {
 }
 
 const iso = (value: Date | string) => new Date(value).toISOString();
-
-/** The earliest time a pending message is due, or null when nothing is pending. Kept in a column so it can be indexed. */
-function nextDueAt(messages: StoredSubmission["messages"]): string | null {
-  const due = Object.values(messages)
-    .filter((state: MessageState) => state.status === "pending")
-    .map((state) => state.nextAttemptAt ?? new Date(0).toISOString())
-    .sort();
-  return due[0] ?? null;
-}
 
 function toRecord(row: SubmissionRow): StoredSubmission {
   return {
@@ -222,11 +230,19 @@ export function postgresStore(client: SqlClient, options: PostgresOptions = {}):
     },
 
     async deleteDeliveredBefore(cutoff) {
-      const { rows } = await client.query<{ id: string }>(
-        `delete from ${names.submissions} where delivered_at <= $1 returning id`,
+      // A delivered submission has something left to do only when an alert
+      // about its confirmation is still waiting: it keeps that, without the visitor's data.
+      const emptied = await client.query<{ id: string }>(
+        `update ${names.submissions} set reason = '', data = '{}'::jsonb, fingerprint = ''
+         where delivered_at <= $1 and next_due_at is not null and data <> '{}'::jsonb
+         returning id`,
         [cutoff.toISOString()],
       );
-      return rows.length;
+      const deleted = await client.query<{ id: string }>(
+        `delete from ${names.submissions} where delivered_at <= $1 and next_due_at is null returning id`,
+        [cutoff.toISOString()],
+      );
+      return emptied.rows.length + deleted.rows.length;
     },
   };
 }

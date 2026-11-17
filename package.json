@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "check": "pnpm typecheck && pnpm test",
-    "live-test": "tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/live-test.ts"
+    "live-test": "tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/live-test.ts",
+    "provision-site": "tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/provision-site.ts"
   },
   "dependencies": {
     "zod": "^4.6.7"

@@ -1,6 +1,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 import { migrateContactSchema, postgresRateLimiter, postgresStore, type SqlClient } from "../src/adapters/postgres";
+import { provisionSite } from "../src/adapters/postgres-site";
 import { atelierContact as config } from "../src/example/atelier-contact";
 import {
   deliverSubmission,
@@ -30,6 +31,15 @@ const stores: [string, () => Promise<{ store: SubmissionStore; limiter: RateLimi
     async () => {
       const db = await freshDatabase();
       return { store: postgresStore(db), limiter: postgresRateLimiter(db) };
+    },
+  ],
+  [
+    "postgres, as a site's own role",
+    async () => {
+      const db = new PGlite();
+      const site = await provisionSite(db, { site: "atelier", password: "password-for-site-a-0001" });
+      await db.query(`set role ${site.role}`);
+      return { store: postgresStore(db, site), limiter: postgresRateLimiter(db, site) };
     },
   ],
 ];

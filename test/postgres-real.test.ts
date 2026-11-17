@@ -1,8 +1,9 @@
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { migrateContactSchema, postgresRateLimiter, postgresStore } from "../src/adapters/postgres";
+import { provisionSite } from "../src/adapters/postgres-site";
 import { atelierContact as config } from "../src/example/atelier-contact";
-import { submitContact, type StoredSubmission } from "../src/kit";
+import { processDue, submitContact, type StoredSubmission } from "../src/kit";
 import { MINUTE, setup, START, submission } from "./support";
 
 /**
@@ -115,5 +116,140 @@ describe.skipIf(url === undefined)("on a real PostgreSQL server, with several co
     const { rows } = await pool.query(`select id from contact_submissions where id like 'submit-%'`);
     expect(rows).toHaveLength(1);
     expect(mail.attempts).toHaveLength(2);
+  });
+});
+
+/**
+ * Each site logs in with its own role. `set role` in PGlite shows the
+ * permissions; only a real login shows that a site can't become another site.
+ */
+describe.skipIf(url === undefined)("on a real PostgreSQL server, logged in as a site's own role", () => {
+  const suffix = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+  const sites = { a: `test_a_${suffix}`, b: `test_b_${suffix}` };
+  const passwords = { a: `pw-a-${suffix}-${Math.random()}`, b: `pw-b-${suffix}-${Math.random()}` };
+  let admin: pg.Pool;
+  let asA: pg.Pool;
+  let a: Awaited<ReturnType<typeof provisionSite>>;
+  let b: Awaited<ReturnType<typeof provisionSite>>;
+
+  const loginAs = (role: string, password: string) => {
+    const login = new URL(url!);
+    login.username = role;
+    login.password = password;
+    return new pg.Pool({ connectionString: login.toString(), max: 2 });
+  };
+
+  beforeAll(async () => {
+    admin = new pg.Pool({ connectionString: url, max: 1 });
+    a = await provisionSite(admin, { site: sites.a, password: passwords.a });
+    b = await provisionSite(admin, { site: sites.b, password: passwords.b });
+    asA = loginAs(a.role, passwords.a);
+  });
+
+  afterAll(async () => {
+    await asA?.end();
+    for (const site of [a, b]) {
+      if (site === undefined) continue;
+      await admin.query(`drop schema if exists ${site.schema} cascade`);
+      await admin.query(`drop role if exists ${site.role}`);
+    }
+    await admin?.end();
+  });
+
+  it("stores and delivers through the kit", async () => {
+    const { deps, clock, mail } = setup();
+    const siteDeps = { ...deps, store: postgresStore(asA, a), rateLimiter: postgresRateLimiter(asA, a) };
+
+    const result = await submitContact(config, siteDeps, await submission("devis", clock.now()), {
+      address: "203.0.113.7",
+    });
+    await processDue(config, siteDeps);
+
+    expect(result).toMatchObject({ status: "accepted" });
+    expect(mail.sent).toHaveLength(2);
+    const { rows } = await asA.query<{ current_user: string }>(`select current_user`);
+    expect(rows[0]?.current_user).toBe(a.role);
+  });
+
+  it("finds its own tables without being told the schema", async () => {
+    const { rows } = await asA.query(`select id from contact_submissions`);
+    expect(rows).toHaveLength(1);
+  });
+
+  it("can't reach the other site's tables, through the kit or directly", async () => {
+    const denied = /permission denied/;
+    await expect(postgresStore(asA, b).findByToken("any")).rejects.toThrow(denied);
+    await expect(postgresStore(asA, b).listDue(START)).rejects.toThrow(denied);
+    await expect(postgresRateLimiter(asA, b).hit("visitor", START, MINUTE, 5, "form-1")).rejects.toThrow(denied);
+    await expect(asA.query(`select * from ${b.schema}.contact_submissions`)).rejects.toThrow(denied);
+    await expect(asA.query(`delete from ${b.schema}.contact_submissions`)).rejects.toThrow(denied);
+  });
+
+  it("can't become the other site or the administrator", async () => {
+    await expect(asA.query(`set role ${b.role}`)).rejects.toThrow(/permission denied/);
+    const { rows } = await admin.query<{ current_user: string }>(`select current_user`);
+    await expect(asA.query(`set role ${rows[0]!.current_user}`)).rejects.toThrow(/permission denied/);
+  });
+
+  it("can't change the structure of its own tables, or create anything", async () => {
+    const refused = /permission denied|must be owner/;
+    await expect(asA.query(`drop table ${a.schema}.contact_submissions`)).rejects.toThrow(refused);
+    await expect(asA.query(`create table ${a.schema}.extra (x int)`)).rejects.toThrow(refused);
+    await expect(asA.query(`create table public.extra_${suffix} (x int)`)).rejects.toThrow(refused);
+    await expect(asA.query(`create schema extra_${suffix}`)).rejects.toThrow(refused);
+  });
+
+  it.each([
+    ["can already read the other site's messages", (role: string) => [
+      `create role ${role} login`,
+      `grant usage on schema ${b.schema} to ${role}`,
+      `grant select on ${b.schema}.contact_submissions to ${role}`,
+    ]],
+    ["is a superuser", (role: string) => [`create role ${role} login superuser`]],
+  ])("refuses to set up a site whose existing role %s, and changes nothing", async (_case, before) => {
+    const site = `test_c_${suffix}`;
+    const role = `site_${site}`;
+    try {
+      for (const statement of before(role)) await admin.query(statement);
+
+      await expect(provisionSite(admin, { site, password: `pw-c-${suffix}-${Math.random()}` })).rejects.toThrow(
+        /can't be set up safely, and nothing was changed/,
+      );
+
+      const { rows } = await admin.query(`select 1 from pg_namespace where nspname = $1`, [role]);
+      expect(rows).toEqual([]);
+    } finally {
+      await admin.query(`drop owned by ${role}`).catch(() => undefined);
+      await admin.query(`drop role if exists ${role}`);
+    }
+  });
+
+  it("refuses to set up a site when everyone can read one column of a table elsewhere", async () => {
+    const other = `other_${suffix}`;
+    const site = `test_d_${suffix}`;
+    try {
+      await admin.query(`create schema ${other}`);
+      await admin.query(`create table ${other}.secret (value text)`);
+      await admin.query(`grant usage on schema ${other} to public`);
+      await admin.query(`grant select (value) on ${other}.secret to public`);
+
+      await expect(provisionSite(admin, { site, password: `pw-d-${suffix}-${Math.random()}` })).rejects.toThrow(
+        new RegExp(`public can select ${other}\\.secret`),
+      );
+
+      const { rows } = await admin.query(`select 1 from pg_roles where rolname = $1`, [`site_${site}`]);
+      expect(rows).toEqual([]);
+    } finally {
+      await admin.query(`drop schema if exists ${other} cascade`);
+    }
+  });
+
+  it("can't log in with the wrong password, or as the other site with its own", async () => {
+    const wrong = loginAs(a.role, "not-the-password");
+    await expect(wrong.query(`select 1`)).rejects.toThrow(/password authentication failed/);
+    await wrong.end();
+    const crossed = loginAs(b.role, passwords.a);
+    await expect(crossed.query(`select 1`)).rejects.toThrow(/password authentication failed/);
+    await crossed.end();
   });
 });

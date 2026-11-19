@@ -132,12 +132,13 @@ describe.skipIf(url === undefined)("on a real PostgreSQL server, logged in as a 
   let a: Awaited<ReturnType<typeof provisionSite>>;
   let b: Awaited<ReturnType<typeof provisionSite>>;
 
-  const loginAs = (role: string, password: string) => {
+  const loginUrl = (role: string, password: string) => {
     const login = new URL(url!);
     login.username = role;
     login.password = password;
-    return new pg.Pool({ connectionString: login.toString(), max: 2 });
+    return login.toString();
   };
+  const loginAs = (role: string, password: string) => new pg.Pool({ connectionString: loginUrl(role, password), max: 2 });
 
   beforeAll(async () => {
     admin = new pg.Pool({ connectionString: url, max: 1 });
@@ -205,7 +206,8 @@ describe.skipIf(url === undefined)("on a real PostgreSQL server, logged in as a 
       `grant usage on schema ${b.schema} to ${role}`,
       `grant select on ${b.schema}.contact_submissions to ${role}`,
     ]],
-    ["is a superuser", (role: string) => [`create role ${role} login superuser`]],
+    // Not SUPERUSER: managed services such as Scaleway don't let the administrator grant it. PGlite covers it.
+    ["can create databases", (role: string) => [`create role ${role} login createdb`]],
   ])("refuses to set up a site whose existing role %s, and changes nothing", async (_case, before) => {
     const site = `test_c_${suffix}`;
     const role = `site_${site}`;
@@ -219,6 +221,11 @@ describe.skipIf(url === undefined)("on a real PostgreSQL server, logged in as a 
       const { rows } = await admin.query(`select 1 from pg_namespace where nspname = $1`, [role]);
       expect(rows).toEqual([]);
     } finally {
+      // Without superuser (managed services), dropping what a role owns needs its privileges: the admin, which created it,
+      // grants them to itself first. GRANT doesn't accept current_user here, so the admin is named, and INHERIT and SET
+      // are explicit: the grant PostgreSQL 16+ gave the creator has them off, and a plain GRANT keeps them that way.
+      const { rows: me } = await admin.query<{ name: string }>(`select current_user as name`);
+      await admin.query(`grant ${role} to "${me[0]!.name}" with inherit true, set true`).catch(() => undefined);
       await admin.query(`drop owned by ${role}`).catch(() => undefined);
       await admin.query(`drop role if exists ${role}`);
     }
@@ -241,6 +248,23 @@ describe.skipIf(url === undefined)("on a real PostgreSQL server, logged in as a 
       expect(rows).toEqual([]);
     } finally {
       await admin.query(`drop schema if exists ${other} cascade`);
+    }
+  });
+
+  it("refuses connections over the site's limit", async () => {
+    const site = `test_e_${suffix}`;
+    const password = `pw-e-${suffix}`;
+    const c = await provisionSite(admin, { site, password, connectionLimit: 1 });
+    const first = new pg.Client({ connectionString: loginUrl(c.role, password) });
+    const second = new pg.Client({ connectionString: loginUrl(c.role, password) });
+    try {
+      await first.connect();
+      await expect(second.connect()).rejects.toThrow(/too many connections for role/);
+    } finally {
+      await first.end().catch(() => {});
+      await second.end().catch(() => {});
+      await admin.query(`drop schema if exists ${c.schema} cascade`);
+      await admin.query(`drop role if exists ${c.role}`);
     }
   });
 

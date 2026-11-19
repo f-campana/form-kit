@@ -1,3 +1,4 @@
+import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
 import { migrateContactSchema, type SqlClient } from "./postgres";
 
 /**
@@ -19,10 +20,35 @@ export interface ProvisionSiteInput {
   readonly password: string;
   /** Set a new password on a role that already exists. */
   readonly rotatePassword?: boolean;
+  /**
+   * How many connections the site's role may hold at once, 10 by default, so
+   * one site can't use up the database's connections. Applied on every run.
+   * Past it, a submission can't be stored and the visitor is asked to retry.
+   */
+  readonly connectionLimit?: number;
 }
 
 const SITE_NAME = /^[a-z][a-z0-9_]{0,39}$/;
 const MIN_PASSWORD_LENGTH = 20;
+/** Printable ASCII with no space, which SCRAM's SASLprep step leaves unchanged. */
+const PASSWORD_CHARACTERS = /^[\x21-\x7e]+$/;
+const DEFAULT_CONNECTION_LIMIT = 10;
+const SCRAM_ITERATIONS = 4096;
+
+/**
+ * The SCRAM-SHA-256 verifier PostgreSQL stores for a password (RFC 5802 and
+ * RFC 7677), in the form `pg_authid` keeps it. Sending this instead of the
+ * password keeps the password itself off the server: a statement log shows
+ * only what the database stores anyway.
+ */
+export function scramVerifier(password: string, salt: Buffer = randomBytes(16)): string {
+  const salted = pbkdf2Sync(password, salt, SCRAM_ITERATIONS, 32, "sha256");
+  const clientKey = createHmac("sha256", salted).update("Client Key").digest();
+  const storedKey = createHash("sha256").update(clientKey).digest();
+  const serverKey = createHmac("sha256", salted).update("Server Key").digest();
+  const b64 = (bytes: Buffer) => bytes.toString("base64");
+  return `SCRAM-SHA-256$${SCRAM_ITERATIONS}:${b64(salt)}$${b64(storedKey)}:${b64(serverKey)}`;
+}
 
 export function siteNames(site: string): { schema: string; role: string } {
   if (!SITE_NAME.test(site)) {
@@ -37,55 +63,70 @@ export function siteNames(site: string): { schema: string; role: string } {
  * Creates or upgrades one site's schema, tables and role. Safe to run again:
  * existing submissions are kept and an existing role keeps its password.
  *
- * It runs as the database administrator, and refuses, before changing
- * anything, a database where the site wouldn't be isolated: a role that
- * already exists with more rights than a site needs, or a schema someone
- * else owns or can reach. It reports what it found rather than removing
- * rights it didn't grant, since those may be there on purpose. It checks
- * again once the site is set up.
+ * It runs as the database administrator, and refuses a database where the
+ * site wouldn't be isolated: a role that already exists with more rights than
+ * a site needs, or a schema someone else owns or can reach. It reports what it
+ * found rather than removing rights it didn't grant, since those may be there
+ * on purpose. It checks before and after setting the site up.
+ *
+ * Everything happens in one transaction: if a step or the last check fails,
+ * nothing is changed. So `admin` must be a single connection (a `pg.Client`,
+ * or a pool of one), not a pool that may send each statement elsewhere.
  */
 export async function provisionSite(admin: SqlClient, input: ProvisionSiteInput): Promise<SiteDatabase> {
   const { schema, role } = siteNames(input.site);
-  if (input.password.length < MIN_PASSWORD_LENGTH) {
-    throw new Error(`The site password must be at least ${MIN_PASSWORD_LENGTH} characters long.`);
-  }
-
-  const existing = await admin.query(`select rolname from pg_roles where rolname = $1`, [role]);
-  const roleCreated = existing.rows.length === 0;
-
-  const before = await isolationProblems(admin, schema, role, roleCreated);
-  if (before.length > 0) {
-    throw new Error(`Site ${input.site} can't be set up safely, and nothing was changed:\n${list(before)}`);
-  }
-
-  await admin.query(`create schema if not exists "${schema}"`);
-  await migrateContactSchema(admin, { schema });
-
-  if (roleCreated || input.rotatePassword === true) {
-    // format() quotes the role and the password, so neither can break out of the statement.
-    const template = roleCreated
-      ? "create role %I login nosuperuser nocreatedb nocreaterole noinherit noreplication nobypassrls password %L"
-      : "alter role %I password %L";
-    const { rows } = await admin.query<{ statement: string }>(`select format($1::text, $2::text, $3::text) as statement`, [
-      template,
-      role,
-      input.password,
-    ]);
-    await admin.query(rows[0]!.statement);
-  }
-
-  await admin.query(`grant usage on schema "${schema}" to "${role}"`);
-  await admin.query(`grant select, insert, update, delete on all tables in schema "${schema}" to "${role}"`);
-  await admin.query(`alter role "${role}" set search_path = "${schema}"`);
-
-  const after = await isolationProblems(admin, schema, role, false);
-  if (after.length > 0) {
+  if (input.password.length < MIN_PASSWORD_LENGTH || !PASSWORD_CHARACTERS.test(input.password)) {
     throw new Error(
-      `Site ${input.site} was set up, but isn't isolated:\n${list(after)}\nFix these and run it again` +
-        (roleCreated ? ", with --rotate-password to get the role's connection URL." : "."),
+      `The site password must be at least ${MIN_PASSWORD_LENGTH} characters long, in printable ASCII with no spaces.`,
     );
   }
-  return { schema, role, roleCreated };
+  const connectionLimit = input.connectionLimit ?? DEFAULT_CONNECTION_LIMIT;
+  if (!Number.isInteger(connectionLimit) || connectionLimit < 1 || connectionLimit > 1000) {
+    throw new Error("The connection limit must be a whole number from 1 to 1000.");
+  }
+
+  await admin.query("begin");
+  try {
+    const existing = await admin.query(`select rolname from pg_roles where rolname = $1`, [role]);
+    const roleCreated = existing.rows.length === 0;
+
+    const before = await isolationProblems(admin, schema, role, roleCreated);
+    if (before.length > 0) {
+      throw new Error(`Site ${input.site} can't be set up safely, and nothing was changed:\n${list(before)}`);
+    }
+
+    await admin.query(`create schema if not exists "${schema}"`);
+    await migrateContactSchema(admin, { schema });
+
+    if (roleCreated) {
+      await admin.query(`create role "${role}" login nosuperuser nocreatedb nocreaterole noinherit noreplication nobypassrls`);
+    }
+    if (roleCreated || input.rotatePassword === true) {
+      // Only the hash is sent. format() quotes it, though it holds only base64 and punctuation.
+      const { rows } = await admin.query<{ statement: string }>(
+        `select format('alter role %I password %L', $1::text, $2::text) as statement`,
+        [role, scramVerifier(input.password)],
+      );
+      await admin.query(rows[0]!.statement);
+    }
+    await admin.query(`alter role "${role}" connection limit ${connectionLimit}`);
+
+    await admin.query(`grant usage on schema "${schema}" to "${role}"`);
+    await admin.query(`grant select, insert, update, delete on all tables in schema "${schema}" to "${role}"`);
+    await admin.query(`alter role "${role}" set search_path = "${schema}"`);
+
+    const after = await isolationProblems(admin, schema, role, false);
+    if (after.length > 0) {
+      throw new Error(
+        `Site ${input.site} can't be set up safely, and nothing was changed. Once set up, it wouldn't be isolated:\n${list(after)}`,
+      );
+    }
+    await admin.query("commit");
+    return { schema, role, roleCreated };
+  } catch (error) {
+    await admin.query("rollback").catch(() => {});
+    throw error;
+  }
 }
 
 const list = (problems: string[]) => problems.map((problem) => `- ${problem}`).join("\n");

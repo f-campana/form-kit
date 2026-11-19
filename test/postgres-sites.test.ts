@@ -47,6 +47,84 @@ describe("one schema and one role per site", () => {
     expect(queries).toEqual([]);
   });
 
+  it("refuses a password with characters other than printable ASCII, before touching the database", async () => {
+    const queries: string[] = [];
+    const spy = { query: async (text: string) => (queries.push(text), { rows: [] }) };
+    for (const password of ["password with spaces 0001", "mot-de-passe-évident-0001"]) {
+      await expect(provisionSite(spy, { site: "atelier", password })).rejects.toThrow(/password/);
+    }
+    expect(queries).toEqual([]);
+  });
+
+  it("sends the password to the server only as a SCRAM hash, so it can't appear in its logs", async () => {
+    const db = new PGlite();
+    const password = "password-for-site-a-0001";
+    const sent: string[] = [];
+    const recording = {
+      query: async <Row>(text: string, params?: unknown[]) => {
+        sent.push(text, ...(params ?? []).map(String));
+        return db.query<Row>(text, params);
+      },
+    };
+
+    await provisionSite(recording, { site: "atelier", password });
+    await provisionSite(recording, { site: "atelier", password: "password-for-site-a-0002", rotatePassword: true });
+
+    expect(sent.join("\n")).not.toContain("password-for-site-a-000");
+    const { rows } = await db.query<{ rolpassword: string }>(`select rolpassword from pg_authid where rolname = 'site_atelier'`);
+    // Stored exactly as sent: the server accepted it as a hash rather than hashing it again.
+    expect(rows[0]?.rolpassword).toMatch(/^SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$/);
+    expect(sent).toContain(rows[0]?.rolpassword);
+  });
+
+  it("limits how many connections a site's role can open, on new and existing roles", async () => {
+    const db = new PGlite();
+    const limitOf = async () =>
+      (await db.query<{ rolconnlimit: number }>(`select rolconnlimit from pg_roles where rolname = 'site_atelier'`)).rows[0]
+        ?.rolconnlimit;
+
+    await provisionSite(db, { site: "atelier", password: "password-for-site-a-0001" });
+    expect(await limitOf()).toBe(10);
+    await provisionSite(db, { site: "atelier", password: "password-for-site-a-0001", connectionLimit: 3 });
+    expect(await limitOf()).toBe(3);
+    await expect(
+      provisionSite(db, { site: "atelier", password: "password-for-site-a-0001", connectionLimit: 0 }),
+    ).rejects.toThrow(/connection limit/);
+  });
+
+  describe("is all or nothing", () => {
+    const leftovers = async (db: PGlite) => ({
+      schemas: (await db.query(`select 1 from pg_namespace where nspname = 'site_atelier'`)).rows.length,
+      roles: (await db.query(`select 1 from pg_roles where rolname = 'site_atelier'`)).rows.length,
+    });
+
+    it("changes nothing when a step fails partway", async () => {
+      const db = new PGlite();
+      const failing = {
+        query: async <Row>(text: string, params?: unknown[]) => {
+          if (text.startsWith("grant usage")) throw new Error("connection lost");
+          return db.query<Row>(text, params);
+        },
+      };
+
+      await expect(provisionSite(failing, { site: "atelier", password: "password-for-site-a-0001" })).rejects.toThrow(
+        /connection lost/,
+      );
+      expect(await leftovers(db)).toEqual({ schemas: 0, roles: 0 });
+    });
+
+    it("changes nothing when the site isn't isolated once set up", async () => {
+      const db = new PGlite();
+      // Tables the administrator creates from now on are readable by everyone: only visible once the tables exist.
+      await db.query(`alter default privileges grant select on tables to public`);
+
+      await expect(provisionSite(db, { site: "atelier", password: "password-for-site-a-0001" })).rejects.toThrow(
+        /nothing was changed[\s\S]*PUBLIC has privileges on site_atelier\.contact_submissions/,
+      );
+      expect(await leftovers(db)).toEqual({ schemas: 0, roles: 0 });
+    });
+  });
+
   it("sets up a site, and can be run again without losing anything", async () => {
     const { db, a, actAs } = await twoSites();
     expect(a).toEqual({ schema: "site_atelier", role: "site_atelier", roleCreated: true });

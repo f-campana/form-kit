@@ -1,7 +1,7 @@
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { migrateContactSchema, postgresRateLimiter, postgresStore } from "../src/adapters/postgres";
-import { provisionSite } from "../src/adapters/postgres-site";
+import { checkSite, provisionSite } from "../src/adapters/postgres-site";
 import { atelierContact as config } from "../src/example/atelier-contact";
 import { processDue, submitContact, type StoredSubmission } from "../src/kit";
 import { MINUTE, setup, START, submission } from "./support";
@@ -275,5 +275,101 @@ describe.skipIf(url === undefined)("on a real PostgreSQL server, logged in as a 
     const crossed = loginAs(b.role, passwords.a);
     await expect(crossed.query(`select 1`)).rejects.toThrow(/password authentication failed/);
     await crossed.end();
+  });
+});
+
+/**
+ * What the audit stands for, shown by behaviour: with a changed unique index a
+ * duplicate really is stored, and the audit says so; with the kit's own index
+ * the server refuses it. Also server settings, which only a real server grants
+ * the way production does. It uses a database of its own, dropped at the end.
+ */
+describe.skipIf(url === undefined)("the audit, against what a real server enforces", () => {
+  const suffix = `${Date.now()}${Math.floor(Math.random() * 1e4)}`.slice(-10);
+  const database = `form_kit_audit_${suffix}`;
+  const site = `audit${suffix}`;
+  const role = `site_${site}`;
+  const submissions = `"${role}".contact_submissions`;
+  const hits = `"${role}".contact_rate_hits`;
+  let server: pg.Client;
+  let db: pg.Client;
+
+  beforeAll(async () => {
+    server = new pg.Client({ connectionString: url });
+    await server.connect();
+    await server.query(`create database ${database}`);
+    const own = new URL(url!);
+    own.pathname = `/${database}`;
+    db = new pg.Client({ connectionString: own.toString() });
+    await db.connect();
+    await provisionSite(db, { site, password: "password-for-the-audit-0001" });
+  });
+
+  afterAll(async () => {
+    await db?.query(`revoke all on parameter work_mem from ${role}`).catch(() => {});
+    await db?.end();
+    await server?.query(`drop database if exists ${database} with (force)`);
+    await server?.query(`drop role if exists ${role}`);
+    await server?.end();
+  });
+
+  const insertToken = (id: string, fingerprint: string) =>
+    db.query(
+      `insert into ${submissions} (id, reference, token_id, fingerprint, created_at, reason, data, messages)
+       values ($1, 'r', 'one-token', $2, now(), 'autre', '{}', '{}')`,
+      [id, fingerprint],
+    );
+  const insertHit = (at: string) => db.query(`insert into ${hits} (key, hit_at, form_id) values ('visitor', $1, 'one-form')`, [at]);
+
+  it("passes as set up, and the server refuses a second submission or hit for one form", async () => {
+    expect(await checkSite(db, site)).toEqual([]);
+    await insertToken("a", "first");
+    await expect(insertToken("b", "second")).rejects.toThrow(/contact_submissions_token/);
+    await insertHit("2026-01-01T00:00:00Z");
+    await expect(insertHit("2026-01-01T00:01:00Z")).rejects.toThrow(/contact_rate_hits_form/);
+  });
+
+  it.each([
+    [
+      "token",
+      "contact_submissions_token",
+      () => `create unique index contact_submissions_token on ${submissions} (token_id, lower(fingerprint))`,
+      () => insertToken("c", "third"),
+      () => `delete from ${submissions} where id = 'c'`,
+      () => `create unique index contact_submissions_token on ${submissions} (token_id)`,
+    ],
+    [
+      "rate-limit",
+      "contact_rate_hits_form",
+      () => `create unique index contact_rate_hits_form on ${hits} (key, form_id, hit_at)`,
+      () => insertHit("2026-01-01T00:02:00Z"),
+      () => `delete from ${hits} where hit_at = '2026-01-01T00:02:00Z'`,
+      () => `create unique index contact_rate_hits_form on ${hits} (key, form_id)`,
+    ],
+  ])("catches a %s index that lets a duplicate in", async (_name, index, broken, duplicate, undo, restore) => {
+    await db.query(`drop index "${role}".${index}`);
+    await db.query(broken());
+
+    await expect(duplicate()).resolves.toBeDefined();
+    expect((await checkSite(db, site)).join("\n")).toContain(`${index} isn't the one the kit creates`);
+
+    await db.query(undo());
+    await db.query(`drop index "${role}".${index}`);
+    await db.query(restore());
+    expect(await checkSite(db, site)).toEqual([]);
+  });
+
+  it.each([
+    ["without grant option", ""],
+    ["with grant option", " with grant option"],
+  ])("refuses a server setting granted %s", async (_name, option) => {
+    await db.query(`grant set, alter system on parameter work_mem to ${role}${option}`);
+
+    const problems = (await checkSite(db, site)).join("\n");
+
+    expect(problems).toContain("work_mem");
+    if (option) expect(problems).toContain("with grant option");
+    await db.query(`revoke all on parameter work_mem from ${role} cascade`);
+    expect(await checkSite(db, site)).toEqual([]);
   });
 });

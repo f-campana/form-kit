@@ -175,13 +175,29 @@ describe("--check after a partial restore", () => {
     [
       "a unique index restored as a plain one",
       "drop index site_atelier.contact_rate_hits_form; create index contact_rate_hits_form on site_atelier.contact_rate_hits (key, form_id)",
-      /isn't the unique index on \(key,form_id\)/,
+      /contact_rate_hits_form isn't the one the kit creates/,
     ],
     [
       "a unique index that covers only some rows",
       "drop index site_atelier.contact_submissions_token; create unique index contact_submissions_token on site_atelier.contact_submissions (token_id) where reason = 'devis'",
-      /isn't the unique index on \(token_id\)/,
+      /contact_submissions_token isn't the one the kit creates/,
     ],
+    ["a unique token index with an expression added", "drop index site_atelier.contact_submissions_token; create unique index contact_submissions_token on site_atelier.contact_submissions (token_id, lower(fingerprint))", /contact_submissions_token isn't the one/],
+    ["a unique token index on an expression only", "drop index site_atelier.contact_submissions_token; create unique index contact_submissions_token on site_atelier.contact_submissions (lower(token_id))", /contact_submissions_token isn't the one/],
+    ["a unique token index with an extra column", "drop index site_atelier.contact_submissions_token; create unique index contact_submissions_token on site_atelier.contact_submissions (token_id, fingerprint)", /contact_submissions_token isn't the one/],
+    ["a unique token index with INCLUDE", "drop index site_atelier.contact_submissions_token; create unique index contact_submissions_token on site_atelier.contact_submissions (token_id) include (fingerprint)", /contact_submissions_token isn't the one/],
+    ["a rate-limit index with an expression added", "drop index site_atelier.contact_rate_hits_form; create unique index contact_rate_hits_form on site_atelier.contact_rate_hits (key, form_id, (hit_at is null))", /contact_rate_hits_form isn't the one/],
+    ["a rate-limit index in another order", "drop index site_atelier.contact_rate_hits_form; create unique index contact_rate_hits_form on site_atelier.contact_rate_hits (form_id, key)", /contact_rate_hits_form isn't the one/],
+    ["another operator class", "drop index site_atelier.contact_submissions_token; create unique index contact_submissions_token on site_atelier.contact_submissions (token_id text_pattern_ops)", /contact_submissions_token isn't the one/],
+    ["another collation on the index", "drop index site_atelier.contact_submissions_token; create unique index contact_submissions_token on site_atelier.contact_submissions (token_id collate \"C\")", /contact_submissions_token isn't the one/],
+    ["another collation on the column", "alter table site_atelier.contact_submissions alter column reason type text collate \"C\"", /reason has another collation/],
+    ["a deferred primary key", "alter table site_atelier.contact_submissions drop constraint contact_submissions_pkey; alter table site_atelier.contact_submissions add primary key (id) deferrable initially deferred", /primary key isn't enforced/],
+    ["an unlogged table", "alter table site_atelier.contact_rate_hits set unlogged", /not an ordinary, logged table/],
+    ["an added unique index", "create unique index surprise on site_atelier.contact_submissions (reason)", /unknown unique or exclusion index surprise/],
+    ["an added check constraint", "alter table site_atelier.contact_submissions add constraint odd check (reason <> 'devis')", /unknown constraint odd/],
+    ["an added trigger", "create function site_atelier.skip() returns trigger language plpgsql as 'begin return null; end'; create trigger skip before insert on site_atelier.contact_submissions for each row execute function site_atelier.skip()", /unknown trigger skip/],
+    ["an added rule", "create rule swallow as on insert to site_atelier.contact_rate_hits do instead nothing", /unknown rule swallow/],
+    ["row-level security", "alter table site_atelier.contact_submissions enable row level security", /has row-level security/],
     ["a lost lookup index", "drop index site_atelier.contact_submissions_next_due", /missing the index contact_submissions_next_due/],
   ];
 
@@ -202,6 +218,7 @@ describe("rights held with grant option", () => {
     ],
     ["usage on the site's own schema", "grant usage on schema site_atelier to site_atelier with grant option"],
     ["a table of its own", "grant select on site_atelier.contact_submissions to site_atelier with grant option"],
+    ["a server setting", "grant set on parameter work_mem to site_atelier with grant option"],
     ["one column", "grant update (reason) on site_atelier.contact_submissions to site_atelier with grant option"],
   ];
 

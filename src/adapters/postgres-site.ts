@@ -215,46 +215,95 @@ const EXPECTED_COLUMNS: Record<string, [name: string, type: string, notNull: boo
   ],
 };
 
-/** Each index the kit creates: its table, whether it must be unique, and its columns. The first is the primary key. */
-const EXPECTED_INDEXES: [name: string | null, table: string, unique: boolean, columns: string][] = [
-  [null, "contact_submissions", true, "id"],
-  ["contact_submissions_token", "contact_submissions", true, "token_id"],
-  ["contact_submissions_next_due", "contact_submissions", false, "next_due_at"],
-  ["contact_submissions_delivered", "contact_submissions", false, "delivered_at"],
-  ["contact_rate_hits_key", "contact_rate_hits", false, "key,hit_at"],
-  ["contact_rate_hits_form", "contact_rate_hits", true, "key,form_id"],
+/**
+ * Each index the kit creates, as PostgreSQL describes it, without the table's
+ * schema. The whole definition is compared, so an expression, an extra or
+ * reordered column, INCLUDE, a different order, operator class or collation, a
+ * WHERE clause or a missing UNIQUE all count as a different index. The primary
+ * key may have any name, written here as <primary>.
+ */
+const EXPECTED_INDEXES: [name: string | null, table: string, definition: string][] = [
+  [null, "contact_submissions", "CREATE UNIQUE INDEX <primary> ON contact_submissions USING btree (id)"],
+  ["contact_submissions_token", "contact_submissions", "CREATE UNIQUE INDEX contact_submissions_token ON contact_submissions USING btree (token_id)"],
+  [
+    "contact_submissions_next_due",
+    "contact_submissions",
+    "CREATE INDEX contact_submissions_next_due ON contact_submissions USING btree (next_due_at) WHERE (next_due_at IS NOT NULL)",
+  ],
+  [
+    "contact_submissions_delivered",
+    "contact_submissions",
+    "CREATE INDEX contact_submissions_delivered ON contact_submissions USING btree (delivered_at) WHERE (delivered_at IS NOT NULL)",
+  ],
+  ["contact_rate_hits_key", "contact_rate_hits", "CREATE INDEX contact_rate_hits_key ON contact_rate_hits USING btree (key, hit_at)"],
+  ["contact_rate_hits_form", "contact_rate_hits", "CREATE UNIQUE INDEX contact_rate_hits_form ON contact_rate_hits USING btree (key, form_id)"],
 ];
 
 /**
- * Whether the tables, their columns and their indexes are all there. A partial
- * restore can lose any of them while every right still looks fine: without
- * the tables nothing is stored, and without the unique indexes a resend is
- * stored twice and the rate limit can be passed.
+ * Whether the tables, their columns and their indexes are what the kit creates,
+ * with nothing added that could change what an insert does. A partial or
+ * altered restore can lose or change any of these while every right still looks
+ * fine: without the tables nothing is stored, and without the unique indexes a
+ * resend is stored twice and the rate limit can be passed.
  */
 async function shapeProblems(admin: SqlClient, schema: string): Promise<string[]> {
-  const columns = await admin.query<{ table_name: string; name: string; type: string; not_null: boolean; has_default: boolean }>(
+  const columns = await admin.query<{
+    table_name: string;
+    name: string;
+    type: string;
+    not_null: boolean;
+    has_default: boolean;
+    plain: boolean;
+  }>(
     `select c.relname as table_name, a.attname as name, format_type(a.atttypid, a.atttypmod) as type,
-       a.attnotnull as not_null, a.atthasdef as has_default
+       a.attnotnull as not_null, a.atthasdef as has_default,
+       a.attcollation = t.typcollation and a.attgenerated = '' and a.attidentity = '' as plain
      from pg_class c join pg_namespace n on n.oid = c.relnamespace
      join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+     join pg_type t on t.oid = a.atttypid
      where n.nspname = $1 and c.relkind in ('r', 'p') and c.relname in ('contact_submissions', 'contact_rate_hits')`,
     [schema],
   );
-  const indexes = await admin.query<{ index_name: string; table_name: string; is_unique: boolean; is_primary: boolean; usable: boolean; partial: boolean; columns: string }>(
+  const indexes = await admin.query<{
+    index_name: string;
+    table_name: string;
+    is_unique: boolean;
+    is_primary: boolean;
+    excludes: boolean;
+    usable: boolean;
+    immediate: boolean;
+    definition: string;
+  }>(
     `select i.relname as index_name, t.relname as table_name, x.indisunique as is_unique, x.indisprimary as is_primary,
-       x.indisvalid and x.indisready as usable, x.indpred is not null as partial,
-       (select string_agg(a.attname, ',' order by k.position)
-        from unnest(x.indkey::int2[]) with ordinality as k(attnum, position)
-        join pg_attribute a on a.attrelid = x.indrelid and a.attnum = k.attnum) as columns
+       x.indisexclusion as excludes, x.indisvalid and x.indisready and x.indislive as usable,
+       x.indimmediate as immediate, pg_get_indexdef(x.indexrelid) as definition
      from pg_index x
      join pg_class i on i.oid = x.indexrelid
      join pg_class t on t.oid = x.indrelid
      join pg_namespace n on n.oid = t.relnamespace
-     where n.nspname = $1`,
+     where n.nspname = $1 and t.relname in ('contact_submissions', 'contact_rate_hits')`,
+    [schema],
+  );
+  // Anything else on the tables that can refuse, change or hide a row.
+  const additions = await admin.query<{ problem: string }>(
+    `with kit as (
+       select c.oid, c.relname, c.relkind, c.relpersistence, c.relrowsecurity
+       from pg_class c join pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = $1 and c.relname in ('contact_submissions', 'contact_rate_hits')
+     )
+     select format('%s is not an ordinary, logged table', relname) as problem from kit
+       where relkind <> 'r' or relpersistence <> 'p'
+     union all select format('%s has row-level security', relname) from kit where relrowsecurity
+     union all select format('%s has an unknown constraint %I', k.relname, c.conname)
+       from kit k join pg_constraint c on c.conrelid = k.oid where c.contype in ('c', 'f', 'u', 'x')
+     union all select format('%s has an unknown trigger %I', k.relname, g.tgname)
+       from kit k join pg_trigger g on g.tgrelid = k.oid where not g.tgisinternal
+     union all select format('%s has an unknown rule %I', k.relname, r.rulename)
+       from kit k join pg_rewrite r on r.ev_class = k.oid`,
     [schema],
   );
 
-  const problems: string[] = [];
+  const problems: string[] = additions.rows.map((row) => `${schema}.${row.problem}`);
   for (const [table, expected] of Object.entries(EXPECTED_COLUMNS)) {
     const found = columns.rows.filter((row) => row.table_name === table);
     if (found.length === 0) {
@@ -266,22 +315,35 @@ async function shapeProblems(admin: SqlClient, schema: string): Promise<string[]
       if (!column) problems.push(`${schema}.${table} has no column ${name}`);
       else if (column.type !== type) problems.push(`${schema}.${table}.${name} is ${column.type}, not ${type}`);
       else if (column.not_null !== notNull) problems.push(`${schema}.${table}.${name} ${notNull ? "allows" : "forbids"} null`);
+      else if (!column.plain) problems.push(`${schema}.${table}.${name} has another collation, or is generated or an identity`);
     }
     for (const extra of found) {
       if (!expected.some(([name]) => name === extra.name) && extra.not_null && !extra.has_default) {
         problems.push(`${schema}.${table} has an unknown required column ${extra.name}: the kit's inserts would fail`);
       }
     }
-    for (const [name, indexTable, unique, cols] of EXPECTED_INDEXES) {
+
+    const onTable = indexes.rows.filter((row) => row.table_name === table);
+    const matched = new Set<string>();
+    for (const [name, indexTable, definition] of EXPECTED_INDEXES) {
       if (indexTable !== table) continue;
-      const index = indexes.rows.find(
-        (row) => row.table_name === table && (name === null ? row.is_primary : row.index_name === name),
-      );
+      const index = onTable.find((row) => (name === null ? row.is_primary : row.index_name === name));
       const label = name === null ? "the primary key" : `the index ${name}`;
-      if (!index) problems.push(`${schema}.${table} is missing ${label}`);
-      // A partial unique index wouldn't cover every row, so it doesn't count.
-      else if (!index.usable || index.columns !== cols || (unique && (!index.is_unique || index.partial))) {
-        problems.push(`${schema}.${table}: ${label} isn't the ${unique ? "unique " : ""}index on (${cols})`);
+      if (!index) {
+        problems.push(`${schema}.${table} is missing ${label}`);
+        continue;
+      }
+      matched.add(index.index_name);
+      let actual = index.definition.replace(/ ON (?:ONLY )?(?:"?[a-z_][a-z0-9_]*"?\.)?/, " ON ");
+      if (name === null) actual = actual.replace(` INDEX ${index.index_name} ON `, " INDEX <primary> ON ");
+      if (actual !== definition) problems.push(`${schema}.${table}: ${label} isn't the one the kit creates: ${actual}`);
+      else if (!index.usable || (index.is_unique && !index.immediate)) {
+        problems.push(`${schema}.${table}: ${label} isn't enforced (invalid, or checked only at commit)`);
+      }
+    }
+    for (const other of onTable) {
+      if (!matched.has(other.index_name) && (other.is_unique || other.excludes)) {
+        problems.push(`${schema}.${table} has an unknown unique or exclusion index ${other.index_name}`);
       }
     }
   }
@@ -484,6 +546,7 @@ async function isolationProblems(
        union all select format('foreign-data wrapper %I', fdwname), fdwacl from pg_foreign_data_wrapper
        union all select format('large object %s', oid), lomacl from pg_largeobject_metadata
        union all select format('tablespace %I', spcname), spcacl from pg_tablespace
+       union all select format('server setting %I', parname), paracl from pg_parameter_acl
        union all select format('default privileges of %s', defaclrole::regrole), defaclacl from pg_default_acl
      )
      select format('%s can pass on %s on %s (granted with grant option)', $1::text, string_agg(distinct x.privilege_type, ', '), what) as problem

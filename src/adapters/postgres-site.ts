@@ -11,9 +11,34 @@ export interface SiteDatabase {
   readonly role: string;
   /** False when the role already existed; its password was then left alone unless asked otherwise. */
   readonly roleCreated: boolean;
+  /**
+   * True when the role has no right to connect to the database yet. On a
+   * managed Scaleway database only the console can give it (see
+   * `consoleConnectStep`); set that, then run setup again.
+   */
+  readonly connectPending: boolean;
 }
 
-export interface ProvisionSiteInput {
+export interface SiteModeOptions {
+  /**
+   * One database instance for one site, on a managed service whose console is
+   * the only way to let a role connect (Scaleway). It accepts exactly the
+   * rights the console adds with the "Read" permission, and refuses a second
+   * site on the same database. Without it, the strict rule for a shared
+   * database applies.
+   */
+  readonly dedicatedInstance?: boolean;
+}
+
+/** Scaleway's internal administrator, which owns the default privileges its console creates. */
+export const PROVIDER_ADMIN_ROLE = "_rdb_superadmin";
+
+/** What to do in the console when a role has no right to connect. */
+export function consoleConnectStep(role: string, database: string): string {
+  return `In the Scaleway console: the Database Instance > Users > ${role} > set its permission on the database "${database}" to Read. Then run setup again: Read also replaces the table rights, which setup restores.`;
+}
+
+export interface ProvisionSiteInput extends SiteModeOptions {
   /** Lowercase letters, digits and underscores, starting with a letter. */
   readonly site: string;
   /** The role's password, used when the role is created or `rotatePassword` is set. */
@@ -85,12 +110,14 @@ export async function provisionSite(admin: SqlClient, input: ProvisionSiteInput)
     throw new Error("The connection limit must be a whole number from 1 to 1000.");
   }
 
+  const dedicated = input.dedicatedInstance === true;
+
   await admin.query("begin");
   try {
     const existing = await admin.query(`select rolname from pg_roles where rolname = $1`, [role]);
     const roleCreated = existing.rows.length === 0;
 
-    const before = await isolationProblems(admin, schema, role, roleCreated);
+    const before = await isolationProblems(admin, schema, role, roleCreated, dedicated);
     if (before.length > 0) {
       throw new Error(`Site ${input.site} can't be set up safely, and nothing was changed:\n${list(before)}`);
     }
@@ -115,18 +142,74 @@ export async function provisionSite(admin: SqlClient, input: ProvisionSiteInput)
     await admin.query(`grant select, insert, update, delete on all tables in schema "${schema}" to "${role}"`);
     await admin.query(`alter role "${role}" set search_path = "${schema}"`);
 
-    const after = await isolationProblems(admin, schema, role, false);
+    const after = await isolationProblems(admin, schema, role, false, dedicated);
     if (after.length > 0) {
       throw new Error(
         `Site ${input.site} can't be set up safely, and nothing was changed. Once set up, it wouldn't be isolated:\n${list(after)}`,
       );
     }
+    const connectPending = !(await canConnect(admin, role));
     await admin.query("commit");
-    return { schema, role, roleCreated };
+    return { schema, role, roleCreated, connectPending };
   } catch (error) {
     await admin.query("rollback").catch(() => {});
     throw error;
   }
+}
+
+async function canConnect(admin: SqlClient, role: string): Promise<boolean> {
+  const { rows } = await admin.query<{ ok: boolean }>(
+    `select has_database_privilege($1, current_database(), 'connect') as ok`,
+    [role],
+  );
+  return rows[0]?.ok === true;
+}
+
+/**
+ * A read-only audit of a site that is already set up: everything setup would
+ * refuse, plus the rights the site needs but may have lost. A restore or a
+ * permission change in a provider's console can alter them silently, so run
+ * it after either. It changes nothing.
+ */
+export async function checkSite(admin: SqlClient, site: string, options: SiteModeOptions = {}): Promise<string[]> {
+  const { schema, role } = siteNames(site);
+  const dedicated = options.dedicatedInstance === true;
+  await admin.query("begin transaction read only");
+  try {
+    const existing = await admin.query(`select rolname from pg_roles where rolname = $1`, [role]);
+    if (existing.rows.length === 0) return [`the role ${role} doesn't exist: run setup`];
+    const problems = await isolationProblems(admin, schema, role, false, dedicated);
+    problems.push(...(await missingRights(admin, schema, role)));
+    if (!(await canConnect(admin, role))) {
+      problems.push(`${role} can't connect to this database${dedicated ? " (set it in the console)" : ""}`);
+    }
+    return problems;
+  } finally {
+    await admin.query("rollback").catch(() => {});
+  }
+}
+
+/** The rights the site needs on its own schema and tables, and the ones it must not have there. */
+async function missingRights(admin: SqlClient, schema: string, role: string): Promise<string[]> {
+  const { rows } = await admin.query<{ problem: string }>(
+    `select format('%s can''t use schema %I', $1::text, nspname) as problem
+     from pg_namespace where nspname = $2 and not has_schema_privilege($1, oid, 'usage')
+     union all
+     select format('%I has no schema %I: run setup', current_database(), $2::text)
+     where not exists (select 1 from pg_namespace where nspname = $2)
+     union all
+     select format('%s can''t %s %I.%I', $1::text, p.privilege, n.nspname, c.relname)
+     from pg_class c join pg_namespace n on n.oid = c.relnamespace
+     cross join unnest(array['select', 'insert', 'update', 'delete']) as p(privilege)
+     where n.nspname = $2 and c.relkind in ('r', 'p') and not has_table_privilege($1, c.oid, p.privilege)
+     union all
+     select format('%s can %s %I.%I, which it doesn''t need', $1::text, p.privilege, n.nspname, c.relname)
+     from pg_class c join pg_namespace n on n.oid = c.relnamespace
+     cross join unnest(array['truncate', 'references', 'trigger']) as p(privilege)
+     where n.nspname = $2 and c.relkind in ('r', 'p') and has_table_privilege($1, c.oid, p.privilege)`,
+    [role, schema],
+  );
+  return rows.map((row) => row.problem);
 }
 
 const list = (problems: string[]) => problems.map((problem) => `- ${problem}`).join("\n");
@@ -136,6 +219,12 @@ const list = (problems: string[]) => problems.map((problem) => `- ${problem}`).j
  * let anyone else reach them. When the role doesn't exist yet, the checks on
  * what it could reach use PUBLIC, whose rights every new role gets.
  *
+ * On a dedicated instance (`dedicatedInstance`) it accepts what the provider's
+ * console adds to let a role connect, and nothing more: connect and temporary
+ * on this database, usage on public, and the provider's own read-level default
+ * privileges in public and in the site's schema. It then also requires that no
+ * other site exists, because those rights would reach it.
+ *
  * What it assumes: the database holds only the sites set up this way, and
  * only the administrator changes rights in it. The checks describe the
  * database at the moment setup runs; a right granted later isn't caught
@@ -143,7 +232,13 @@ const list = (problems: string[]) => problems.map((problem) => `- ${problem}`).j
  * default, are allowed: they reach only what the caller already can. Every
  * role can still see the names of other sites' tables in the catalog.
  */
-async function isolationProblems(admin: SqlClient, schema: string, role: string, roleAbsent: boolean): Promise<string[]> {
+async function isolationProblems(
+  admin: SqlClient,
+  schema: string,
+  role: string,
+  roleAbsent: boolean,
+  dedicated: boolean,
+): Promise<string[]> {
   const who = roleAbsent ? "public" : role;
   const checks: [string, unknown[]][] = [
     // The role's own attributes.
@@ -182,8 +277,21 @@ async function isolationProblems(admin: SqlClient, schema: string, role: string,
            and d.dbid = (select oid from pg_database where datname = current_database())
            and ((d.classid = 'pg_namespace'::regclass and d.objid = (select oid from pg_namespace where nspname = $2))
              or (d.classid = 'pg_class'::regclass and d.objid in (
-               select c.oid from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = $2))))`,
-      [role, schema],
+               select c.oid from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = $2))))
+         -- Dedicated instance only: what the console's "Read" permission adds. The privileges are checked below.
+         and not ($3::boolean and d.deptype = 'a'
+           and d.dbid in (0, (select oid from pg_database where datname = current_database()))
+           and ((d.classid = 'pg_database'::regclass and d.objid = (select oid from pg_database where datname = current_database()))
+             or (d.classid = 'pg_namespace'::regclass and d.objid = (select oid from pg_namespace where nspname = 'public'))
+             or (d.classid = 'pg_default_acl'::regclass and d.objid in (
+               select a.oid from pg_default_acl a
+               where a.defaclrole = (select oid from pg_roles where rolname = $4)
+                 and a.defaclnamespace in (select oid from pg_namespace where nspname in ('public', $2))
+                 and not exists (
+                   select 1 from aclexplode(a.defaclacl) x
+                   where x.grantee = (select oid from pg_roles where rolname = $1)
+                     and x.privilege_type not in ('SELECT', 'USAGE', 'EXECUTE'))))))`,
+      [role, schema, dedicated, PROVIDER_ADMIN_ROLE],
     ],
     // What the role can actually do to tables outside its schema, however it got the right (directly or through
     // PUBLIC), on the whole table or on a single column.
@@ -261,6 +369,43 @@ async function isolationProblems(admin: SqlClient, schema: string, role: string,
       [schema, role],
     ],
   ];
+
+  // Extensions that open connections from the database server, which a site never needs.
+  checks.push([
+    `select format('the extension %I is installed in this database: it can open connections elsewhere', extname) as problem
+     from pg_extension where extname in ('dblink', 'postgres_fdw', 'file_fdw')`,
+    [],
+  ]);
+  if (dedicated) {
+    checks.push(
+      // The allow-list above accepts the database and public-schema entries, so their privileges are limited here.
+      [
+        `select format('%s has %s on database %I, more than connect and temporary', $1::text, string_agg(x.privilege_type, ', '), d.datname) as problem
+         from pg_database d, aclexplode(d.datacl) x
+         where d.datname = current_database() and x.grantee = (select oid from pg_roles where rolname = $1)
+           and x.privilege_type not in ('CONNECT', 'TEMPORARY')
+         group by d.datname`,
+        [role],
+      ],
+      [
+        `select format('%s has %s on schema public, more than usage', $1::text, string_agg(x.privilege_type, ', ')) as problem
+         from pg_namespace n, aclexplode(n.nspacl) x
+         where n.nspname = 'public' and x.grantee = (select oid from pg_roles where rolname = $1)
+           and x.privilege_type <> 'USAGE'
+         group by n.nspname`,
+        [role],
+      ],
+      // One instance, one site: the console's rights cover the whole database.
+      [
+        `select format('a second site is set up here (schema %I): a dedicated instance holds one site', nspname) as problem
+         from pg_namespace where nspname like 'site\\_%' and nspname <> $1
+         union all
+         select format('a second site role exists on this instance (%I): a dedicated instance holds one site', rolname)
+         from pg_roles where rolname like 'site\\_%' and rolname <> $2`,
+        [schema, role],
+      ],
+    );
+  }
 
   const problems: string[] = [];
   for (const [sql, params] of checks) {

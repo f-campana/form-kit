@@ -127,7 +127,7 @@ describe("one schema and one role per site", () => {
 
   it("sets up a site, and can be run again without losing anything", async () => {
     const { db, a, actAs } = await twoSites();
-    expect(a).toEqual({ schema: "site_atelier", role: "site_atelier", roleCreated: true });
+    expect(a).toEqual({ schema: "site_atelier", role: "site_atelier", roleCreated: true, connectPending: false });
 
     await actAs(a.role);
     const { deps, clock } = setup();
@@ -137,7 +137,7 @@ describe("one schema and one role per site", () => {
 
     const again = await provisionSite(db, { site: "atelier", password: "password-for-site-a-0001" });
 
-    expect(again).toEqual({ schema: "site_atelier", role: "site_atelier", roleCreated: false });
+    expect(again).toEqual({ schema: "site_atelier", role: "site_atelier", roleCreated: false, connectPending: false });
     const { rows } = await db.query<{ id: string }>(`select id from site_atelier.contact_submissions`);
     expect(rows).toEqual([{ id: "sub-1" }]);
   });

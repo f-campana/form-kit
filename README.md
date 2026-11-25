@@ -95,6 +95,24 @@ pnpm provision-site atelier
 - **All or nothing:** before and after setting the site up, it checks that the site would be isolated. If a check or a step fails, it changes nothing and lists what it found. It never removes rights it didn't grant: you fix those by hand, then run it again. One exception: if the connection drops during the final commit, the script can't know whether the commit happened. Run it again to find out: it's safe to repeat. If it says the role already existed, add `--rotate-password` to get a connection URL.
 - **Managed databases:** it needs an administrator that can create roles, not a superuser. That's how Scaleway's admin user works.
 
+### One instance per site (Scaleway)
+
+On a managed Scaleway database, the admin can't grant a role the right to connect; only the console can, and its "Read" permission also gives rights on the whole database, on `public`, and default rights for future objects. So a Scaleway instance holds **one site**, set up with `--dedicated-instance`:
+
+1. `pnpm provision-site atelier --dedicated-instance` creates the schema, tables and role, prints the `DATABASE_URL` once, and, if the role can't connect, tells you the console step (exit code 2).
+2. In the console, set the role's permission on the database to **Read**. Read replaces the table rights with read-only ones.
+3. Run the same command again: it restores the site's rights and checks the result.
+
+This mode accepts only what Read adds (connect and temporary on this database, usage on `public`, the provider's own read-level default privileges in `public` and the site's schema) and refuses anything else, as well as a second `site_*` schema or role: those rights would reach it. The strict rule above stays the default. Either mode refuses `dblink`, `postgres_fdw` and `file_fdw`.
+
+**Check after any restore or permission change in the console:**
+
+```bash
+pnpm provision-site atelier --dedicated-instance --check
+```
+
+It changes nothing and exits 1 with the problems it finds, including rights the site has lost. A restore can silently change rights; if it fails, run setup again and check again. In the URL the site uses, replace the IP with the instance's hostname and drop `sslmode` and `sslrootcert`: a site on Vercel passes the certificate as text (`DATABASE_CA`).
+
 ## Live test with Scaleway
 
 These steps happen in your own Scaleway account. Neither agent creates accounts or handles the key.

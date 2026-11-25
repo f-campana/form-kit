@@ -53,6 +53,9 @@ async function runCheck(): Promise<void> {
   const problems = await checkSite(admin, site!, { dedicatedInstance });
   if (problems.length === 0) {
     console.log(`Site ${site} passes the check. Nothing was changed.`);
+    console.log(
+      "This reads the catalog only: it doesn't log in as the site or run its queries, and it can't show that an extension can't be installed later.",
+    );
     return;
   }
   console.error(`Site ${site} fails the check. Nothing was changed:\n${problems.map((p) => `- ${p}`).join("\n")}`);

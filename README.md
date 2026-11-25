@@ -103,7 +103,9 @@ On a managed Scaleway database, the admin can't grant a role the right to connec
 2. In the console, set the role's permission on the database to **Read**. Read replaces the table rights with read-only ones.
 3. Run the same command again: it restores the site's rights and checks the result.
 
-This mode accepts only what Read adds (connect and temporary on this database, usage on `public`, the provider's own read-level default privileges in `public` and the site's schema) and refuses anything else, as well as a second `site_*` schema or role: those rights would reach it. The strict rule above stays the default. Either mode refuses `dblink`, `postgres_fdw` and `file_fdw`.
+This mode accepts only what Read adds (connect and temporary on this database, usage on `public`, the provider's own read-level default privileges in `public` and the site's schema) and refuses anything else, as well as a second `site_*` schema or role: those rights would reach it. The strict rule above stays the default. Either mode refuses `dblink`, `postgres_fdw` and `file_fdw` **when installed**.
+
+**What a pass doesn't show.** `--check` reads the catalog: it doesn't log in as the site, run its queries or restore anything, so after a restore, also submit a test message. A site role may be able to install one of the refused extensions later (one probe on a throwaway database could create `dblink`); the check can't rule that out. The one-site rule sees only `site_*` schemas and roles, so it can't tell that another client uses the instance under other names.
 
 **Check after any restore or permission change in the console:**
 
@@ -111,7 +113,7 @@ This mode accepts only what Read adds (connect and temporary on this database, u
 pnpm provision-site atelier --dedicated-instance --check
 ```
 
-It changes nothing and exits 1 with the problems it finds, including rights the site has lost. A restore can silently change rights; if it fails, run setup again and check again. In the URL the site uses, replace the IP with the instance's hostname and drop `sslmode` and `sslrootcert`: a site on Vercel passes the certificate as text (`DATABASE_CA`).
+It changes nothing and exits 1 with the problems it finds, including missing tables, columns or indexes, rights the site has lost, and rights held with grant option. A restore can silently change rights; if it fails, run setup again and check again. In the URL the site uses, replace the IP with the instance's hostname and drop `sslmode` and `sslrootcert`: a site on Vercel passes the certificate as text (`DATABASE_CA`).
 
 ## Live test with Scaleway
 

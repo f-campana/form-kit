@@ -146,3 +146,78 @@ describe("a dedicated instance", () => {
     expect((await checkSite(db, "atelier", { dedicatedInstance: true })).join("\n")).toMatch(expected);
   });
 });
+
+describe("--check after a partial restore", () => {
+  const check = async (db: PGlite) => (await checkSite(db, "atelier", { dedicatedInstance: true })).join("\n");
+
+  it("reports both tables when they are gone", async () => {
+    const { db } = await ready();
+    await db.exec("drop table site_atelier.contact_submissions, site_atelier.contact_rate_hits");
+
+    const problems = await check(db);
+
+    expect(problems).toContain("the table site_atelier.contact_submissions is missing");
+    expect(problems).toContain("the table site_atelier.contact_rate_hits is missing");
+  });
+
+  const damage: [string, string, RegExp][] = [
+    ["one missing table", "drop table site_atelier.contact_rate_hits", /contact_rate_hits is missing/],
+    ["a missing column", "alter table site_atelier.contact_submissions drop column locked_until", /no column locked_until/],
+    ["a changed type", "alter table site_atelier.contact_rate_hits alter column hit_at type text", /hit_at is text/],
+    ["a lost not-null", "alter table site_atelier.contact_submissions alter column reason drop not null", /reason allows null/],
+    ["an unknown required column", "alter table site_atelier.contact_rate_hits add column extra text not null", /unknown required column extra/],
+    [
+      "a lost primary key",
+      "alter table site_atelier.contact_submissions drop constraint contact_submissions_pkey",
+      /missing the primary key/,
+    ],
+    ["a lost unique index", "drop index site_atelier.contact_submissions_token", /missing the index contact_submissions_token/],
+    [
+      "a unique index restored as a plain one",
+      "drop index site_atelier.contact_rate_hits_form; create index contact_rate_hits_form on site_atelier.contact_rate_hits (key, form_id)",
+      /isn't the unique index on \(key,form_id\)/,
+    ],
+    [
+      "a unique index that covers only some rows",
+      "drop index site_atelier.contact_submissions_token; create unique index contact_submissions_token on site_atelier.contact_submissions (token_id) where reason = 'devis'",
+      /isn't the unique index on \(token_id\)/,
+    ],
+    ["a lost lookup index", "drop index site_atelier.contact_submissions_next_due", /missing the index contact_submissions_next_due/],
+  ];
+
+  it.each(damage)("reports %s", async (_name, sql, expected) => {
+    const { db } = await ready();
+    await db.exec(sql);
+    expect(await check(db)).toMatch(expected);
+  });
+});
+
+describe("rights held with grant option", () => {
+  const delegable: [string, string][] = [
+    ["connect on the database", 'grant connect on database "$db" to site_atelier with grant option'],
+    ["usage on public", "grant usage on schema public to site_atelier with grant option"],
+    [
+      "the provider's default privileges",
+      `alter default privileges for role ${PROVIDER_ADMIN_ROLE} in schema public grant select on tables to site_atelier with grant option`,
+    ],
+    ["usage on the site's own schema", "grant usage on schema site_atelier to site_atelier with grant option"],
+    ["a table of its own", "grant select on site_atelier.contact_submissions to site_atelier with grant option"],
+    ["one column", "grant update (reason) on site_atelier.contact_submissions to site_atelier with grant option"],
+  ];
+
+  it.each(delegable)("are refused: %s", async (_name, sql) => {
+    const { db, database } = await ready();
+    await db.exec(sql.replace("$db", database));
+
+    expect((await checkSite(db, "atelier", { dedicatedInstance: true })).join("\n")).toContain("with grant option");
+    await expect(setUp(db)).rejects.toThrow(/with grant option/);
+  });
+
+  it("are refused by the strict shared-database rule too", async () => {
+    const db = new PGlite();
+    await setUp(db, false);
+    await db.exec("grant select on site_atelier.contact_submissions to site_atelier with grant option");
+
+    await expect(setUp(db, false)).rejects.toThrow(/with grant option/);
+  });
+});

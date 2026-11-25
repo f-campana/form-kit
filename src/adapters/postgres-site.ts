@@ -142,10 +142,10 @@ export async function provisionSite(admin: SqlClient, input: ProvisionSiteInput)
     await admin.query(`grant select, insert, update, delete on all tables in schema "${schema}" to "${role}"`);
     await admin.query(`alter role "${role}" set search_path = "${schema}"`);
 
-    const after = await isolationProblems(admin, schema, role, false, dedicated);
+    const after = [...(await isolationProblems(admin, schema, role, false, dedicated)), ...(await shapeProblems(admin, schema))];
     if (after.length > 0) {
       throw new Error(
-        `Site ${input.site} can't be set up safely, and nothing was changed. Once set up, it wouldn't be isolated:\n${list(after)}`,
+        `Site ${input.site} can't be set up safely, and nothing was changed. Once set up, it wouldn't be right:\n${list(after)}`,
       );
     }
     const connectPending = !(await canConnect(admin, role));
@@ -170,6 +170,10 @@ async function canConnect(admin: SqlClient, role: string): Promise<boolean> {
  * refuse, plus the rights the site needs but may have lost. A restore or a
  * permission change in a provider's console can alter them silently, so run
  * it after either. It changes nothing.
+ *
+ * It reads the catalog: it doesn't log in as the site, run its queries, or
+ * restore anything, so a pass isn't proof that the site works after a
+ * restore. Nor does it prove that an extension can't be installed later.
  */
 export async function checkSite(admin: SqlClient, site: string, options: SiteModeOptions = {}): Promise<string[]> {
   const { schema, role } = siteNames(site);
@@ -179,7 +183,7 @@ export async function checkSite(admin: SqlClient, site: string, options: SiteMod
     const existing = await admin.query(`select rolname from pg_roles where rolname = $1`, [role]);
     if (existing.rows.length === 0) return [`the role ${role} doesn't exist: run setup`];
     const problems = await isolationProblems(admin, schema, role, false, dedicated);
-    problems.push(...(await missingRights(admin, schema, role)));
+    problems.push(...(await shapeProblems(admin, schema)), ...(await missingRights(admin, schema, role)));
     if (!(await canConnect(admin, role))) {
       problems.push(`${role} can't connect to this database${dedicated ? " (set it in the console)" : ""}`);
     }
@@ -187,6 +191,101 @@ export async function checkSite(admin: SqlClient, site: string, options: SiteMod
   } finally {
     await admin.query("rollback").catch(() => {});
   }
+}
+
+/** What the kit's tables must look like for the site to store, deduplicate, deliver and purge. */
+const EXPECTED_COLUMNS: Record<string, [name: string, type: string, notNull: boolean][]> = {
+  contact_submissions: [
+    ["id", "text", true],
+    ["reference", "text", true],
+    ["token_id", "text", true],
+    ["fingerprint", "text", true],
+    ["created_at", "timestamp with time zone", true],
+    ["reason", "text", true],
+    ["data", "jsonb", true],
+    ["messages", "jsonb", true],
+    ["next_due_at", "timestamp with time zone", false],
+    ["delivered_at", "timestamp with time zone", false],
+    ["locked_until", "timestamp with time zone", false],
+  ],
+  contact_rate_hits: [
+    ["key", "text", true],
+    ["hit_at", "timestamp with time zone", true],
+    ["form_id", "text", false],
+  ],
+};
+
+/** Each index the kit creates: its table, whether it must be unique, and its columns. The first is the primary key. */
+const EXPECTED_INDEXES: [name: string | null, table: string, unique: boolean, columns: string][] = [
+  [null, "contact_submissions", true, "id"],
+  ["contact_submissions_token", "contact_submissions", true, "token_id"],
+  ["contact_submissions_next_due", "contact_submissions", false, "next_due_at"],
+  ["contact_submissions_delivered", "contact_submissions", false, "delivered_at"],
+  ["contact_rate_hits_key", "contact_rate_hits", false, "key,hit_at"],
+  ["contact_rate_hits_form", "contact_rate_hits", true, "key,form_id"],
+];
+
+/**
+ * Whether the tables, their columns and their indexes are all there. A partial
+ * restore can lose any of them while every right still looks fine: without
+ * the tables nothing is stored, and without the unique indexes a resend is
+ * stored twice and the rate limit can be passed.
+ */
+async function shapeProblems(admin: SqlClient, schema: string): Promise<string[]> {
+  const columns = await admin.query<{ table_name: string; name: string; type: string; not_null: boolean; has_default: boolean }>(
+    `select c.relname as table_name, a.attname as name, format_type(a.atttypid, a.atttypmod) as type,
+       a.attnotnull as not_null, a.atthasdef as has_default
+     from pg_class c join pg_namespace n on n.oid = c.relnamespace
+     join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+     where n.nspname = $1 and c.relkind in ('r', 'p') and c.relname in ('contact_submissions', 'contact_rate_hits')`,
+    [schema],
+  );
+  const indexes = await admin.query<{ index_name: string; table_name: string; is_unique: boolean; is_primary: boolean; usable: boolean; partial: boolean; columns: string }>(
+    `select i.relname as index_name, t.relname as table_name, x.indisunique as is_unique, x.indisprimary as is_primary,
+       x.indisvalid and x.indisready as usable, x.indpred is not null as partial,
+       (select string_agg(a.attname, ',' order by k.position)
+        from unnest(x.indkey::int2[]) with ordinality as k(attnum, position)
+        join pg_attribute a on a.attrelid = x.indrelid and a.attnum = k.attnum) as columns
+     from pg_index x
+     join pg_class i on i.oid = x.indexrelid
+     join pg_class t on t.oid = x.indrelid
+     join pg_namespace n on n.oid = t.relnamespace
+     where n.nspname = $1`,
+    [schema],
+  );
+
+  const problems: string[] = [];
+  for (const [table, expected] of Object.entries(EXPECTED_COLUMNS)) {
+    const found = columns.rows.filter((row) => row.table_name === table);
+    if (found.length === 0) {
+      problems.push(`the table ${schema}.${table} is missing`);
+      continue;
+    }
+    for (const [name, type, notNull] of expected) {
+      const column = found.find((row) => row.name === name);
+      if (!column) problems.push(`${schema}.${table} has no column ${name}`);
+      else if (column.type !== type) problems.push(`${schema}.${table}.${name} is ${column.type}, not ${type}`);
+      else if (column.not_null !== notNull) problems.push(`${schema}.${table}.${name} ${notNull ? "allows" : "forbids"} null`);
+    }
+    for (const extra of found) {
+      if (!expected.some(([name]) => name === extra.name) && extra.not_null && !extra.has_default) {
+        problems.push(`${schema}.${table} has an unknown required column ${extra.name}: the kit's inserts would fail`);
+      }
+    }
+    for (const [name, indexTable, unique, cols] of EXPECTED_INDEXES) {
+      if (indexTable !== table) continue;
+      const index = indexes.rows.find(
+        (row) => row.table_name === table && (name === null ? row.is_primary : row.index_name === name),
+      );
+      const label = name === null ? "the primary key" : `the index ${name}`;
+      if (!index) problems.push(`${schema}.${table} is missing ${label}`);
+      // A partial unique index wouldn't cover every row, so it doesn't count.
+      else if (!index.usable || index.columns !== cols || (unique && (!index.is_unique || index.partial))) {
+        problems.push(`${schema}.${table}: ${label} isn't the ${unique ? "unique " : ""}index on (${cols})`);
+      }
+    }
+  }
+  return problems;
 }
 
 /** The rights the site needs on its own schema and tables, and the ones it must not have there. */
@@ -369,6 +468,30 @@ async function isolationProblems(
       [schema, role],
     ],
   ];
+
+  // A right held WITH GRANT OPTION lets the role pass it on, which no accepted right may allow. Memberships are
+  // refused above, so only direct entries can carry it (PUBLIC can't hold a grant option).
+  checks.push([
+    `with acls(what, acl) as (
+       select format('database %I', datname), datacl from pg_database
+       union all select format('schema %I', nspname), nspacl from pg_namespace
+       union all select format('relation %s', oid::regclass), relacl from pg_class
+       union all select format('column %I of %s', attname, attrelid::regclass), attacl from pg_attribute
+       union all select format('function %s', oid::regprocedure), proacl from pg_proc
+       union all select format('type %s', oid::regtype), typacl from pg_type
+       union all select format('language %I', lanname), lanacl from pg_language
+       union all select format('foreign server %I', srvname), srvacl from pg_foreign_server
+       union all select format('foreign-data wrapper %I', fdwname), fdwacl from pg_foreign_data_wrapper
+       union all select format('large object %s', oid), lomacl from pg_largeobject_metadata
+       union all select format('tablespace %I', spcname), spcacl from pg_tablespace
+       union all select format('default privileges of %s', defaclrole::regrole), defaclacl from pg_default_acl
+     )
+     select format('%s can pass on %s on %s (granted with grant option)', $1::text, string_agg(distinct x.privilege_type, ', '), what) as problem
+     from acls, aclexplode(acls.acl) x
+     where x.is_grantable and x.grantee = (select oid from pg_roles where rolname = $1)
+     group by what`,
+    [role],
+  ]);
 
   // Extensions that open connections from the database server, which a site never needs.
   checks.push([

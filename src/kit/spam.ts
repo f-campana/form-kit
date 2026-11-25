@@ -1,6 +1,7 @@
 /**
- * Spam checks that don't track visitors: a signed form token for the minimum
- * fill time, and a keyed hash of the visitor's address for the rate limit.
+ * Spam checks that don't track visitors: a signed, single-use form token for
+ * the minimum fill time and the form's expiry, and a keyed hash of the
+ * visitor's address for the rate limit.
  * Uses Web Crypto only, so it runs on Node, Bun and edge runtimes alike.
  */
 
@@ -49,21 +50,53 @@ async function sign(secret: string, message: string): Promise<string> {
  */
 export async function issueFormToken(secret: string, now: Date): Promise<string> {
   const issuedAt = String(now.getTime());
-  return `${issuedAt}.${await sign(secret, `form-token:${issuedAt}`)}`;
+  // The random part makes every token unique, so each one can be used once.
+  const nonce = toBase64Url(crypto.getRandomValues(new Uint8Array(16)));
+  return `${issuedAt}.${nonce}.${await sign(secret, `form-token:${issuedAt}.${nonce}`)}`;
 }
 
-export type TokenCheck = "ok" | "too_fast" | "invalid";
+async function sha256(text: string): Promise<string> {
+  return toBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(text))));
+}
+
+/**
+ * What the store keeps to know a token was used. A hash, so the token itself
+ * is never stored. Call it only on a token `checkFormToken` accepted.
+ *
+ * It covers the signed part only, never the signature: a signature can be
+ * spelled several ways that all verify, and each spelling would otherwise
+ * count as a new token.
+ */
+export function formTokenId(token: string): Promise<string> {
+  const [issuedAt, nonce] = token.split(".");
+  return sha256(`form-token-id:${issuedAt}.${nonce}`);
+}
+
+/**
+ * Identifies what a visitor sent, so the same form arriving twice (a double
+ * click, or a resend after a lost response) can be told from a used token
+ * coming back with something else.
+ */
+export function contentFingerprint(reason: string, data: Readonly<Record<string, string>>): Promise<string> {
+  const fields = Object.keys(data)
+    .sort()
+    .map((name) => [name, data[name]]);
+  return sha256(`content:${JSON.stringify([reason, fields])}`);
+}
+
+export type TokenCheck = "ok" | "too_fast" | "expired" | "invalid";
 
 export async function checkFormToken(
   secret: string,
   token: unknown,
   now: Date,
   minFillMs: number,
+  maxAgeMs: number,
 ): Promise<TokenCheck> {
   if (typeof token !== "string") return "invalid";
-  const [issuedAt, signature, ...rest] = token.split(".");
-  if (issuedAt === undefined || signature === undefined || rest.length > 0) return "invalid";
-  if (!/^\d{1,15}$/.test(issuedAt)) return "invalid";
+  const [issuedAt, nonce, signature, ...rest] = token.split(".");
+  if (issuedAt === undefined || nonce === undefined || signature === undefined || rest.length > 0) return "invalid";
+  if (!/^\d{1,15}$/.test(issuedAt) || !/^[A-Za-z0-9_-]{1,64}$/.test(nonce)) return "invalid";
   const signatureBytes = fromBase64Url(signature);
   if (signatureBytes === undefined) return "invalid";
 
@@ -71,10 +104,12 @@ export async function checkFormToken(
     "HMAC",
     await hmacKey(secret, "verify"),
     signatureBytes,
-    encoder.encode(`form-token:${issuedAt}`),
+    encoder.encode(`form-token:${issuedAt}.${nonce}`),
   );
   if (!valid) return "invalid";
-  return now.getTime() - Number(issuedAt) < minFillMs ? "too_fast" : "ok";
+  const age = now.getTime() - Number(issuedAt);
+  if (age < minFillMs) return "too_fast";
+  return age >= maxAgeMs ? "expired" : "ok";
 }
 
 /**

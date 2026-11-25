@@ -1,8 +1,12 @@
-import type { Clock, Logger, MessageState, RateLimiter, StoredSubmission, SubmissionStore } from "./ports";
-
-const isDue = (state: MessageState, now: Date) =>
-  state.status === "pending" &&
-  (state.nextAttemptAt === undefined || Date.parse(state.nextAttemptAt) <= now.getTime());
+import { alertPending, needsWork } from "./due";
+import type {
+  Clock,
+  Logger,
+  RateLimiter,
+  StoredSubmission,
+  SubmissionStore,
+  TokenHolder,
+} from "./ports";
 
 /**
  * Keeps submissions in memory. For tests and local runs only: everything is
@@ -12,11 +16,24 @@ export function memoryStore(): SubmissionStore & {
   readonly records: ReadonlyMap<string, StoredSubmission>;
 } {
   const records = new Map<string, StoredSubmission>();
+  const holderOf = (tokenId: string): TokenHolder | undefined => {
+    for (const { id, reference, fingerprint, tokenId: used } of records.values()) {
+      if (used === tokenId) return { id, reference, fingerprint };
+    }
+    return undefined;
+  };
   return {
     records,
     async insert(record) {
+      // No await between the check and the write, so the two are one step.
+      const existing = holderOf(record.tokenId);
+      if (existing !== undefined) return { stored: false, existing };
       if (records.has(record.id)) throw new Error("Duplicate submission ID");
       records.set(record.id, structuredClone(record));
+      return { stored: true };
+    },
+    async findByToken(tokenId) {
+      return holderOf(tokenId);
     },
     async claim(id, now, leaseMs) {
       const record = records.get(id);
@@ -26,19 +43,29 @@ export function memoryStore(): SubmissionStore & {
       return structuredClone(record);
     },
     async release(record) {
-      const { lockedUntil: _released, ...rest } = record;
-      records.set(record.id, structuredClone(rest));
+      const stored = records.get(record.id);
+      if (stored === undefined) return;
+      const { lockedUntil: _released, ...rest } = stored;
+      records.set(record.id, {
+        ...rest,
+        messages: structuredClone(record.messages),
+        ...(record.deliveredAt === undefined ? {} : { deliveredAt: record.deliveredAt }),
+      });
     },
     async listDue(now) {
       return [...records.values()]
-        .filter((record) => Object.values(record.messages).some((state) => isDue(state, now)))
+        .filter((record) => Object.values(record.messages).some((state) => needsWork(state, now)))
         .map((record) => record.id);
     },
     async deleteDeliveredBefore(cutoff) {
       let count = 0;
       for (const [id, record] of records) {
-        if (record.deliveredAt !== undefined && Date.parse(record.deliveredAt) <= cutoff.getTime()) {
+        if (record.deliveredAt === undefined || Date.parse(record.deliveredAt) > cutoff.getTime()) continue;
+        if (!Object.values(record.messages).some(alertPending)) {
           records.delete(id);
+          count += 1;
+        } else if (Object.keys(record.data).length > 0) {
+          records.set(id, { ...record, reason: "", data: {}, fingerprint: "" });
           count += 1;
         }
       }
@@ -49,19 +76,20 @@ export function memoryStore(): SubmissionStore & {
 
 /** Counts hits in memory, dropping them once they leave the window. Per instance only. */
 export function memoryRateLimiter(): RateLimiter & { readonly keys: () => string[] } {
-  const hits = new Map<string, number[]>();
+  const hits = new Map<string, { readonly time: number; readonly formId: string }[]>();
   return {
     keys: () => [...hits.keys()],
-    async hit(key, now, windowMs, max) {
+    async hit(key, now, windowMs, max, formId) {
       const since = now.getTime() - windowMs;
-      for (const [visitor, times] of hits) {
-        const recent = times.filter((time) => time > since);
+      for (const [visitor, entries] of hits) {
+        const recent = entries.filter((entry) => entry.time > since);
         if (recent.length === 0) hits.delete(visitor);
         else hits.set(visitor, recent);
       }
       const recent = hits.get(key) ?? [];
+      if (recent.some((entry) => entry.formId === formId)) return true;
       if (recent.length >= max) return false;
-      hits.set(key, [...recent, now.getTime()]);
+      hits.set(key, [...recent, { time: now.getTime(), formId }]);
       return true;
     },
   };

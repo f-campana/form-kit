@@ -8,9 +8,23 @@ import {
   purgeDelivered,
   submitContact,
 } from "../src/kit";
-import { DAY, MINUTE, REASONS, SECRET, setup, submission, VISITOR } from "./support";
+import { DAY, MINUTE, REASON_VALUES, REASONS, respelled, SECRET, setup, submission, VISITOR } from "./support";
 
 // Written from pilot-spec.md §3, independently of the implementation.
+/** Eight characters, without the look-alikes 0, O, 1, I, L and U. */
+const REFERENCE = expect.stringMatching(/^[2-9A-HJKMNP-TV-Z]{8}$/);
+
+/** The alert for a message that failed for good: the site, the reference and the error, no visitor data. */
+const failedAlert = (message: string, attempts: number, lastError: string) => ({
+  kind: "delivery_failed",
+  site: config.siteName,
+  submissionId: "sub-1",
+  reference: REFERENCE,
+  message,
+  attempts,
+  lastError,
+});
+
 const EXPECTED_RECIPIENTS = {
   devis: ["fondateur@example.test"],
   visite: ["fondateur@example.test"],
@@ -25,7 +39,7 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
 
       const result = await submitContact(config, deps, await submission(reason, clock.now()));
 
-      expect(result).toEqual({ status: "accepted", id: "sub-1" });
+      expect(result).toEqual({ status: "accepted", id: "sub-1", reference: REFERENCE });
       expect(mail.sent.map((email) => email.to)).toEqual([EXPECTED_RECIPIENTS[reason], [VISITOR.email]]);
     });
   });
@@ -107,7 +121,7 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
       const { deps, clock, mail, store, alerts } = setup({ failWhen: () => true });
 
       const result = await submitContact(config, deps, await submission("devis", clock.now()));
-      expect(result).toEqual({ status: "accepted", id: "sub-1" });
+      expect(result).toEqual({ status: "accepted", id: "sub-1", reference: REFERENCE });
       expect(store.records.get("sub-1")?.messages.notification).toMatchObject({ status: "pending", attempts: 1 });
 
       clock.advance(4 * MINUTE);
@@ -122,8 +136,8 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
       await processDue(config, deps);
       expect(mail.attempts).toHaveLength(6); // third and last attempt, 35 minutes in
       expect(alerts).toEqual([
-        { submissionId: "sub-1", message: "notification", attempts: 3, lastError: "provider_unavailable" },
-        { submissionId: "sub-1", message: "confirmation", attempts: 3, lastError: "provider_unavailable" },
+        failedAlert("notification", 3, "provider_unavailable"),
+        failedAlert("confirmation", 3, "provider_unavailable"),
       ]);
 
       clock.advance(DAY);
@@ -157,7 +171,7 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
 
       await submitContact(config, deps, await submission("devis", clock.now()));
       expect(alerts).toEqual([
-        { submissionId: "sub-1", message: "notification", attempts: 1, lastError: "rejected_400" },
+        failedAlert("notification", 1, "rejected_400"),
       ]);
 
       clock.advance(DAY);
@@ -177,7 +191,7 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
       expect(mail.sent.map((email) => email.to)).toEqual([["atelier@example.test"]]);
       expect(mail.attempts).toHaveLength(4); // one notification, three confirmation attempts
       expect(alerts).toEqual([
-        { submissionId: "sub-1", message: "confirmation", attempts: 3, lastError: "provider_unavailable" },
+        failedAlert("confirmation", 3, "provider_unavailable"),
       ]);
     });
   });
@@ -200,25 +214,154 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
     ["missing", undefined],
     ["forged", "1794390000000.c2lnbmF0dXJlLWZvcmdlZQ"],
     ["malformed", "pas-un-jeton"],
-  ])("silently discards a submission whose form token is %s", async (_case, formToken) => {
+  ])("asks the visitor to try again when the form token is %s, and stores and sends nothing", async (_case, formToken) => {
     const { deps, clock, mail, store } = setup();
 
     const result = await submitContact(config, deps, await submission("autre", clock.now(), { formToken }));
 
-    expect(result).toEqual({ status: "accepted" });
+    expect(result).toEqual({ status: "retry" });
     expect(store.records.size).toBe(0);
     expect(mail.attempts).toHaveLength(0);
   });
 
-  it("silently discards a submission sent faster than a person could fill the form", async () => {
+  it("asks the visitor to try again when the form is sent faster than a person could fill it", async () => {
     const { deps, clock, mail, store } = setup();
     const formToken = await issueFormToken(SECRET, new Date(clock.now().getTime() - 1_000));
 
     const result = await submitContact(config, deps, await submission("autre", clock.now(), { formToken }));
 
-    expect(result).toEqual({ status: "accepted" });
+    expect(result).toEqual({ status: "retry" });
     expect(store.records.size).toBe(0);
     expect(mail.attempts).toHaveLength(0);
+  });
+
+  it("accepts a form left open for just under 24 hours, and asks to try again after that", async () => {
+    const { deps, clock, mail, store } = setup();
+    const formToken = await issueFormToken(SECRET, clock.now());
+
+    clock.advance(DAY - MINUTE);
+    const inTime = await submitContact(config, deps, await submission("autre", clock.now(), { formToken }));
+    expect(inTime).toMatchObject({ status: "accepted", id: "sub-1" });
+
+    clock.advance(MINUTE);
+    const tooLate = await submitContact(config, deps, await submission("autre", clock.now(), { formToken }));
+    expect(tooLate).toEqual({ status: "retry" });
+    expect(store.records.size).toBe(1);
+    expect(mail.sent).toHaveLength(2);
+  });
+
+  describe("a form token can be used once", () => {
+    it("sends one notification and one confirmation for a double click", async () => {
+      const { deps, clock, mail, store } = setup();
+      const form = await submission("devis", clock.now());
+
+      const first = await submitContact(config, deps, form);
+      const second = await submitContact(config, deps, form);
+
+      expect(first).toEqual({ status: "accepted", id: "sub-1", reference: REFERENCE });
+      expect(second).toEqual(first);
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2);
+    });
+
+    it("stores one submission when two identical requests arrive together", async () => {
+      const { deps, clock, mail, store } = setup();
+      const form = await submission("devis", clock.now());
+
+      const [first, second] = await Promise.all([submitContact(config, deps, form), submitContact(config, deps, form)]);
+
+      expect(first).toMatchObject({ status: "accepted", reference: REFERENCE });
+      expect(second).toEqual(first);
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2);
+    });
+
+    it("gives the same reference again when the visitor resends after a lost response", async () => {
+      // The provider is down, so the first attempt has failed and a retry is scheduled.
+      const { deps, clock, mail, store, alerts } = setup({ failWhen: () => true });
+      const form = await submission("devis", clock.now());
+      const first = await submitContact(config, deps, form);
+      expect(mail.attempts).toHaveLength(2);
+
+      clock.advance(2 * MINUTE);
+      const again = await submitContact(config, deps, form);
+
+      expect(again).toEqual(first);
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2); // the resend sends nothing; the scheduled retry will
+      expect(alerts).toEqual([]);
+    });
+
+    it("asks the visitor to try again when a used token comes back with different content", async () => {
+      const { deps, clock, mail, store } = setup();
+      const form = await submission("autre", clock.now());
+      await submitContact(config, deps, form);
+
+      const edited = await submitContact(config, deps, { ...form, message: "Un tout autre message." });
+
+      expect(edited).toEqual({ status: "retry" });
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2);
+    });
+
+    it("can't be used a second time by respelling its signature", async () => {
+      const { deps, clock, mail, store } = setup();
+      const form = await submission("autre", clock.now());
+      const first = await submitContact(config, deps, form);
+
+      const respelt = { ...form, formToken: respelled(String(form["formToken"])) };
+      const same = await submitContact(config, deps, respelt);
+      const edited = await submitContact(config, deps, { ...respelt, message: "Un tout autre message." });
+
+      expect(same).toEqual(first);
+      expect(edited).toEqual({ status: "retry" });
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2);
+    });
+
+    it("doesn't count resends of the same form against the visitor's rate limit", async () => {
+      const { deps, clock, store } = setup();
+      const visitor = { address: "203.0.113.7" };
+      const form = await submission("autre", clock.now());
+
+      for (let i = 0; i < 8; i += 1) {
+        expect(await submitContact(config, deps, form, visitor)).toMatchObject({ status: "accepted", id: "sub-1" });
+      }
+      expect(await submitContact(config, deps, await submission("autre", clock.now()), visitor)).toMatchObject({
+        status: "accepted",
+        id: "sub-2",
+      });
+      expect(store.records.size).toBe(2);
+    });
+
+    it("gives both of two identical requests the same answer, even at the visitor's rate limit", async () => {
+      const { deps, clock, mail, store } = setup();
+      const oneAnHour = { ...config, spam: { ...config.spam, rateLimitMax: 1 } };
+      const visitor = { address: "203.0.113.7" };
+      const form = await submission("devis", clock.now());
+
+      const [first, second] = await Promise.all([
+        submitContact(oneAnHour, deps, form, visitor),
+        submitContact(oneAnHour, deps, form, visitor),
+      ]);
+
+      expect(first).toMatchObject({ status: "accepted", reference: REFERENCE });
+      expect(second).toEqual(first);
+      expect(store.records.size).toBe(1);
+      expect(mail.attempts).toHaveLength(2);
+      // The limit still holds for a different form.
+      const another = await submitContact(oneAnHour, deps, await submission("devis", clock.now()), visitor);
+      expect(another).toEqual({ status: "rate_limited" });
+    });
+
+    it("keeps the token itself out of the store", async () => {
+      const { deps, clock, store } = setup();
+      const form = await submission("autre", clock.now());
+
+      await submitContact(config, deps, form);
+
+      expect(JSON.stringify([...store.records.values()])).not.toContain(String(form["formToken"]));
+    });
   });
 
   it("shows success only once the submission is stored", async () => {
@@ -267,18 +410,49 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
     });
   });
 
-  it("sends the visitor a copy of their request, with nothing internal", async () => {
+  it("confirms to the visitor with a reference and the reason, and nothing they typed", async () => {
     const { deps, clock, mail } = setup();
+    const typed = { ...VISITOR, ...REASON_VALUES.devis };
 
-    await submitContact(config, deps, await submission("devis", clock.now()));
+    const result = await submitContact(config, deps, await submission("devis", clock.now()));
 
     const confirmation = mail.sent[1];
+    const reference = result.status === "accepted" ? result.reference : undefined;
+    expect(reference).toEqual(REFERENCE);
+    expect(confirmation?.to).toEqual([VISITOR.email]);
     expect(confirmation?.replyTo).toBe("atelier@example.test");
-    expect(confirmation?.text).toContain("Demande de devis");
-    expect(confirmation?.text).toContain("Une cuisine en chêne pour une pièce de 12 m².\nAvec un îlot central.");
+    expect(confirmation?.text).toContain(`Référence\u00a0: ${reference}`);
+    expect(confirmation?.text).toContain("Motif\u00a0: Demande de devis");
     expect(confirmation?.text).toContain("Nous reviendrons vers vous pour échanger.");
-    expect(confirmation?.text).not.toContain("fondateur@example.test");
-    expect(confirmation?.text).not.toContain("sub-1");
+    // A confirmation that echoed visitor text could be used to send spam to any address.
+    const outside = `${confirmation?.subject}\n${confirmation?.text}`;
+    for (const [field, value] of Object.entries(typed)) {
+      if (field === "email") continue;
+      for (const line of value.split("\n")) expect(outside, field).not.toContain(line);
+    }
+    expect(outside).not.toContain(VISITOR.email);
+    expect(outside).not.toContain("fondateur@example.test");
+    expect(outside).not.toContain("sub-1");
+  });
+
+  it("gives the recipients the same reference as the visitor", async () => {
+    const { deps, clock, mail } = setup();
+
+    const result = await submitContact(config, deps, await submission("devis", clock.now()));
+
+    const reference = result.status === "accepted" ? result.reference : undefined;
+    expect(mail.sent[0]?.text).toContain(`Référence\u00a0: ${reference}`);
+  });
+
+  it("gives each submission its own reference", async () => {
+    const { deps, clock } = setup();
+
+    const first = await submitContact(config, deps, await submission("devis", clock.now()));
+    const second = await submitContact(config, deps, await submission("devis", clock.now()));
+
+    expect(first).toMatchObject({ reference: REFERENCE });
+    expect(second).toMatchObject({ reference: REFERENCE });
+    expect(first).not.toMatchObject({ reference: (second as { reference?: string }).reference });
   });
 
   it("leaves a blank line after a multi-line answer, and none at the end of the request", async () => {
@@ -321,11 +495,11 @@ describe("Contact form acceptance tests (pilot-spec.md §3)", () => {
     }
   });
 
-  it("deletes a submission 30 days after it's delivered", async () => {
+  it("deletes a submission 7 days after it's delivered", async () => {
     const { deps, clock, store } = setup();
     await submitContact(config, deps, await submission("autre", clock.now()));
 
-    clock.advance(30 * DAY - MINUTE);
+    clock.advance(7 * DAY - MINUTE);
     expect(await purgeDelivered(config, deps)).toBe(0);
 
     clock.advance(MINUTE);

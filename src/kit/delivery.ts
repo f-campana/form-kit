@@ -1,4 +1,6 @@
+import { alertErrorCode } from "./alerts";
 import type { ContactFormConfig } from "./define";
+import { alertDue, alertFailed } from "./due";
 import { confirmationEmail, notificationEmail, UnknownReasonError } from "./messages";
 import { MailerError, type MessageKind, type MessageState, type StoredSubmission } from "./ports";
 import type { ContactDeps } from "./submit";
@@ -10,6 +12,37 @@ const KINDS: readonly MessageKind[] = ["notification", "confirmation"];
 const isDue = (state: MessageState, now: Date) =>
   state.status === "pending" &&
   (state.nextAttemptAt === undefined || Date.parse(state.nextAttemptAt) <= now.getTime());
+
+/**
+ * Tells the developer that a message failed for good, and records when the
+ * alert went out. If it can't go out, it logs an error and leaves the alert
+ * pending, to be tried again later (see `ALERT_RETRY_DELAYS_MS`).
+ */
+async function alertIfPending(
+  config: ContactFormConfig,
+  deps: DeliveryDeps,
+  record: StoredSubmission,
+  kind: MessageKind,
+  now: Date,
+): Promise<void> {
+  const state = record.messages[kind];
+  if (!alertDue(state, now)) return;
+  try {
+    await deps.alerter.alert({
+      kind: "delivery_failed",
+      site: config.siteName,
+      submissionId: record.id,
+      reference: record.reference,
+      message: kind,
+      attempts: state.attempts,
+      lastError: state.lastError ?? "unknown",
+    });
+    record.messages[kind] = { ...state, alertedAt: now.toISOString() };
+  } catch (error) {
+    record.messages[kind] = alertFailed(state, now);
+    deps.logger.error("alert_failed", { id: record.id, message: kind, error: alertErrorCode(error) });
+  }
+}
 
 /**
  * What went wrong, as a code that is safe to store and log (never addresses or
@@ -43,7 +76,10 @@ export async function deliverSubmission(
   try {
     for (const kind of KINDS) {
       const state = record.messages[kind];
-      if (!isDue(state, now)) continue;
+      if (!isDue(state, now)) {
+        await alertIfPending(config, deps, record, kind, now);
+        continue;
+      }
       const attempts = state.attempts + 1;
       try {
         await deps.mailer.send(emailFor(kind, config, record));
@@ -56,11 +92,7 @@ export async function deliverSubmission(
         if (delay === undefined) {
           record.messages[kind] = { status: "failed", attempts, lastError };
           deps.logger.error("email_failed", { id, message: kind, attempts, error: lastError });
-          try {
-            await deps.alerter.alert({ submissionId: id, message: kind, attempts, lastError });
-          } catch {
-            deps.logger.error("alert_failed", { id, message: kind });
-          }
+          await alertIfPending(config, deps, record, kind, now);
         } else {
           const nextAttemptAt = new Date(now.getTime() + delay).toISOString();
           record.messages[kind] = { status: "pending", attempts, lastError, nextAttemptAt };
@@ -69,6 +101,8 @@ export async function deliverSubmission(
       }
     }
 
+    // Delivered starts the retention period (D8). It doesn't wait for an alert:
+    // the alert carries no visitor data, and outlives it if it must (see `purgeDelivered`).
     const { notification, confirmation } = record.messages;
     if (record.deliveredAt === undefined && notification.status === "sent" && confirmation.status !== "pending") {
       record.deliveredAt = now.toISOString();

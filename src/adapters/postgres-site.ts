@@ -15,8 +15,8 @@ export interface SiteDatabase {
   readonly roleCreated: boolean;
   /**
    * True when the role has no right to connect to the database yet. On a
-   * managed Scaleway database only the console can give it (see
-   * `consoleConnectStep`); set that, then run setup again.
+   * managed Scaleway database the admin can't grant it with SQL: set the
+   * role's permission there (see `consoleConnectStep`), then run setup again.
    */
   readonly connectPending: boolean;
 }

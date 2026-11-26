@@ -97,7 +97,7 @@ pnpm provision-site atelier
 
 ### One instance per site (Scaleway)
 
-On a managed Scaleway database, the admin can't grant a role the right to connect; only the console can, and its "Read" permission also gives rights on the whole database, on `public`, and default rights for future objects. So a Scaleway instance holds **one site**, set up with `--dedicated-instance`:
+On a managed Scaleway database, the admin can't grant a role the right to connect with SQL; Scaleway's permission setting does. The console's "Read" is what has been used here (the command line and API document an equivalent `readonly`, untested). It also gives rights on the whole database, on `public`, and default rights for future objects. So a Scaleway instance holds **one site**, set up with `--dedicated-instance`:
 
 1. `pnpm provision-site atelier --dedicated-instance` creates the schema, tables and role, prints the `DATABASE_URL` once, and, if the role can't connect, tells you the console step (exit code 2).
 2. In the console, set the role's permission on the database to **Read**. Read replaces the table rights with read-only ones.

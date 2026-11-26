@@ -113,7 +113,7 @@ This mode accepts only what Read adds (connect and temporary on this database, u
 pnpm provision-site atelier --dedicated-instance --check
 ```
 
-It changes nothing and exits 1 with the problems it finds, including missing tables, columns or indexes, rights the site has lost, and rights held with grant option. A restore can silently change rights; if it fails, run setup again and check again. In the URL the site uses, replace the IP with the instance's hostname and drop `sslmode` and `sslrootcert`: a site on Vercel passes the certificate as text (`DATABASE_CA`).
+It changes nothing and exits 1 with the problems it finds, including missing tables, columns or indexes, rights the site has lost, and rights held with grant option. A restore can silently change rights. Read what it reports before changing anything: running setup again can restore the site's table rights, but it refuses a site that holds rights it didn't expect, and it can't help if the administrator can't connect. After a restore that took away the site's right to connect, follow [Restoring a backup over the same database](#restoring-a-backup-over-the-same-database). In the URL the site uses, replace the IP with the instance's hostname and drop `sslmode` and `sslrootcert`: a site on Vercel passes the certificate as text (`DATABASE_CA`).
 
 #### Restoring a backup over the same database
 
@@ -123,13 +123,18 @@ Tested once, on 26 November 2026: a manual backup restored over `rdb` from the c
 
 **Before restoring.** A restore overwrites the database, and what it overwrites can't be recovered from it. Wait until the backup shows as ready.
 
-**Recover:**
+**Recover.** These steps are only for what this test showed: the site's existing role can no longer connect. First run the check:
 
-1. Run `--check`. After this test it reported only that the role couldn't connect.
-2. In the console, set the role's permission on the database to **Read**. It can connect again, but its table rights are now read-only.
-3. `pnpm provision-site atelier --dedicated-instance` restores the table rights and keeps the password. Don't skip this after choosing Read.
-4. Run `--check` again.
-5. Prove that the site really uses the database: send a test message and see it stored, with both emails sent. A page that loads proves nothing. A retry-and-purge job, if the site has one, also logs in to the database (here it failed with `permission denied for database "rdb"` before step 2), but it can send emails and delete data: look at what is due first.
+```bash
+pnpm provision-site atelier --dedicated-instance --check
+```
+
+In this test it reported one problem: `site_atelier can't connect to this database (set it in the console)`. It didn't mention temporary tables; a separate comparison of the database's rights showed that right was gone too. If the administrator can't connect, or the check reports anything else or something you can't explain, stop and find the cause before changing anything.
+
+1. In the console, set the role's permission on the database to **Read**. It can connect again, but its table rights are now read-only.
+2. Run setup: `pnpm provision-site atelier --dedicated-instance`. It restores the table rights and keeps the password. Don't skip this after choosing Read. It must end with exit code 0: code 2 means the role still can't connect, and code 1 is an error. Either way the site isn't recovered.
+3. Run the check again. It must pass (exit code 0) before the next step.
+4. Prove that the site really uses the database: send a test message and see it stored, with both emails sent. A page that loads proves nothing. A retry-and-purge job, if the site has one, also logs in to the database (here it failed with `permission denied for database "rdb"` before step 1), but it can send emails and delete data: look at what is due first.
 
 **Not tested, and needed before restoring a site with real visitors:**
 

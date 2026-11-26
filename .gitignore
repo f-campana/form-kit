@@ -2,5 +2,5 @@ node_modules/
 coverage/
 .env
 .env.local
-*.pem
 .DS_Store
+*.pem

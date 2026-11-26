@@ -105,7 +105,7 @@ On a managed Scaleway database, the admin can't grant a role the right to connec
 
 This mode accepts only what Read adds (connect and temporary on this database, usage on `public`, the provider's own read-level default privileges in `public` and the site's schema) and refuses anything else, as well as a second `site_*` schema or role: those rights would reach it. The strict rule above stays the default. Either mode refuses `dblink`, `postgres_fdw` and `file_fdw` **when installed**.
 
-**What a pass doesn't show.** `--check` reads the catalog: it doesn't log in as the site, run its queries or restore anything, so after a restore, also submit a test message. A site role may be able to install one of the refused extensions later (one probe on a throwaway database could create `dblink`); the check can't rule that out. The one-site rule sees only `site_*` schemas and roles, so it can't tell that another client uses the instance under other names.
+**What a pass doesn't show.** `--check` reads the catalog: it doesn't log in as the site, run its queries or restore anything, so after a restore, also submit a test message (see below). A site role may be able to install one of the refused extensions later (one probe on a throwaway database could create `dblink`); the check can't rule that out. The one-site rule sees only `site_*` schemas and roles, so it can't tell that another client uses the instance under other names.
 
 **Check after any restore or permission change in the console:**
 
@@ -113,7 +113,38 @@ This mode accepts only what Read adds (connect and temporary on this database, u
 pnpm provision-site atelier --dedicated-instance --check
 ```
 
-It changes nothing and exits 1 with the problems it finds, including missing tables, columns or indexes, rights the site has lost, and rights held with grant option. A restore can silently change rights; if it fails, run setup again and check again. In the URL the site uses, replace the IP with the instance's hostname and drop `sslmode` and `sslrootcert`: a site on Vercel passes the certificate as text (`DATABASE_CA`).
+It changes nothing and exits 1 with the problems it finds, including missing tables, columns or indexes, rights the site has lost, and rights held with grant option. A restore can silently change rights. Read what it reports before changing anything: running setup again can restore the site's table rights, but it refuses a site that holds rights it didn't expect, and it can't help if the administrator can't connect. After a restore that took away the site's right to connect, follow [Restoring a backup over the same database](#restoring-a-backup-over-the-same-database). In the URL the site uses, replace the IP with the instance's hostname and drop `sslmode` and `sslrootcert`: a site on Vercel passes the certificate as text (`DATABASE_CA`).
+
+#### Restoring a backup over the same database
+
+Tested once, on 26 November 2026: a manual backup restored over `rdb` from the console, on an instance holding one site with test data only and every message delivered. This is what was observed, not a promise from Scaleway.
+
+**What happened.** The data went back to the time of the backup: anything stored later was gone, although its emails had already been sent. In the permissions and structure compared (owners, roles, memberships, rights, default rights, indexes, constraints), the one difference was that the site role had **lost the right to connect** and to create temporary tables. Two things looked fine while the site was locked out: the console still showed the role's permission as "Custom", and the contact page still loaded.
+
+**Before restoring.** A restore overwrites the database, and what it overwrites can't be recovered from it. Wait until the backup shows as ready.
+
+**Recover.** These steps are only for what this test showed: the site's existing role can no longer connect. First run the check:
+
+```bash
+pnpm provision-site atelier --dedicated-instance --check
+```
+
+In this test it reported one problem: `site_atelier can't connect to this database (set it in the console)`. It didn't mention temporary tables; a separate comparison of the database's rights showed that right was gone too. If the administrator can't connect, or the check reports anything else or something you can't explain, stop and find the cause before changing anything.
+
+1. In the console, set the role's permission on the database to **Read**. It can connect again, but its table rights are now read-only.
+2. Run setup: `pnpm provision-site atelier --dedicated-instance`. It restores the table rights and keeps the password. Don't skip this after choosing Read. It must end with exit code 0: code 2 means the role still can't connect, and code 1 is an error. Either way the site isn't recovered.
+3. Run the check again. It must pass (exit code 0) before the next step.
+4. Prove that the site really uses the database: send a test message and see it stored, with both emails sent. A page that loads proves nothing. A retry-and-purge job, if the site has one, also logs in to the database (here it failed with `permission denied for database "rdb"` before step 1), but it can send emails and delete data: look at what is due first.
+
+**Not tested, and needed before restoring a site with real visitors:**
+
+- Stop form posts and jobs, and let requests in progress finish.
+- Take a second backup right before overwriting.
+- Decide what to do about delivery state, form tokens and rate limits, which all go back in time: a message that was pending in the backup could be sent again.
+- Have a plan if the administrator can't connect.
+- Restoring into a new database or instance, and point-in-time recovery.
+
+The steps haven't been tried with the `scw` command line. Its `readonly` permission is documented as the console's Read, but whether it changes table rights the same way is untested.
 
 ## Live test with Scaleway
 

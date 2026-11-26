@@ -49,7 +49,7 @@ pnpm check   # type check, then the tests
   - `memory.ts`: in-memory adapters for tests and local runs.
 - `src/adapters/scaleway.ts`: sends the emails through Scaleway Transactional Email's HTTP API, and reads its settings from the environment.
 - `src/adapters/postgres.ts`: keeps submissions and rate-limit hits in Postgres, through any client with a `query(text, params)` method: a `pg` Pool, Neon's serverless Pool, or PGlite. `migrateContactSchema` creates the tables and is safe to run on every deploy. Each operation is a single statement, so overlapping runs can't both take a delivery lease. The rate limit can let through one extra hit when a visitor's requests arrive at exactly the same moment.
-- `src/adapters/postgres-site.ts`: `provisionSite`, which sets up one site in a shared database (see below).
+- `src/adapters/postgres-site.ts`: `provisionSite`, which sets up one site's schema, tables and role (see below).
 - `src/adapters/ses.ts`: sends alert emails through Amazon SES, signing requests itself, so the kit keeps one runtime dependency.
 - `src/example/atelier-contact.ts`: the cabinetmaker's form. In the pilot it belongs in the site's own repository.
 - `scripts/live-test.ts`: sends one sample quote request through a real Scaleway account.
@@ -81,9 +81,9 @@ pnpm check   # type check, then the tests
   - a daily job calls `purgeDelivered`.
 - **A contact page rendered per request.** The form token carries the time the page was served, and a page built in advance would carry its build time instead.
 
-## Several sites in one database
+## Setting up a site's database
 
-Sites share one PostgreSQL database (decision D16). Each gets a schema `site_<name>` with its tables, and a login role of the same name that can read and write those tables and reach nothing else. You run the setup yourself, with the administrator's connection in `ADMIN_DATABASE_URL`:
+Each client site has its own Scaleway PostgreSQL instance (decision D16): set it up with `--dedicated-instance`, as described in [One instance per site](#one-instance-per-site-scaleway). The command also has a stricter default for sites sharing one database, kept for a database that allows it; it doesn't work on Scaleway's managed `rdb`. In both modes, each site gets a schema `site_<name>` with its tables, and a login role of the same name that can read and write those tables. In the strict mode the role reaches nothing else; the dedicated mode also accepts what the console's Read permission adds. You run the setup yourself, with the administrator's connection in `ADMIN_DATABASE_URL`:
 
 ```bash
 pnpm provision-site atelier
@@ -97,7 +97,7 @@ pnpm provision-site atelier
 
 ### One instance per site (Scaleway)
 
-On a managed Scaleway database, the admin can't grant a role the right to connect; only the console can, and its "Read" permission also gives rights on the whole database, on `public`, and default rights for future objects. So a Scaleway instance holds **one site**, set up with `--dedicated-instance`:
+On a managed Scaleway database, the admin can't grant a role the right to connect with SQL; Scaleway's permission setting does. The console's "Read" is what has been used here (the command line and API document an equivalent `readonly`, untested). It also gives rights on the whole database, on `public`, and default rights for future objects. So a Scaleway instance holds **one site**, set up with `--dedicated-instance`:
 
 1. `pnpm provision-site atelier --dedicated-instance` creates the schema, tables and role, prints the `DATABASE_URL` once, and, if the role can't connect, tells you the console step (exit code 2).
 2. In the console, set the role's permission on the database to **Read**. Read replaces the table rights with read-only ones.

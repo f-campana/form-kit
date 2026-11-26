@@ -2,9 +2,11 @@ import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
 import { migrateContactSchema, type SqlClient } from "./postgres";
 
 /**
- * Several sites share one database (decision D16). Each gets a schema holding
- * its tables and a login role that can read and write those tables and reach
- * nothing else: not another site's tables, not the structure of its own.
+ * A site gets a schema holding its tables and a login role that reads and
+ * writes them but can't change their structure. In the default, strict mode
+ * the role reaches nothing else, so several sites can share one database. On
+ * Scaleway each site has its own instance (decision D16), set up in
+ * dedicated-instance mode, which also accepts what the console adds.
  */
 export interface SiteDatabase {
   readonly schema: string;
@@ -13,8 +15,8 @@ export interface SiteDatabase {
   readonly roleCreated: boolean;
   /**
    * True when the role has no right to connect to the database yet. On a
-   * managed Scaleway database only the console can give it (see
-   * `consoleConnectStep`); set that, then run setup again.
+   * managed Scaleway database the admin can't grant it with SQL: set the
+   * role's permission there (see `consoleConnectStep`), then run setup again.
    */
   readonly connectPending: boolean;
 }

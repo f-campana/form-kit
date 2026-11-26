@@ -7,8 +7,9 @@ import { processDue, purgeDelivered, submitContact } from "../src/kit";
 import { DAY, MINUTE, setup, START, submission, VISITOR } from "./support";
 
 /**
- * Several sites share one database. Each gets its own schema and a role that
- * reaches nothing else (decision D16).
+ * The default, strict mode: several sites share one database, and each gets
+ * its own schema and a role that reaches nothing else. (D16 now gives each
+ * client site its own instance; see postgres-dedicated.test.ts.)
  *
  * PGlite has one connection, logged in as the administrator, so these tests
  * become a site with `set role`: that applies the site role's permissions.

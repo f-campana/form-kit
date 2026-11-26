@@ -1,6 +1,6 @@
 /**
- * Sets up one site in the shared database: its schema, its tables and a role
- * that reaches nothing else. Run it yourself, with the administrator's
+ * Sets up one site in its database: its schema, its tables and a role that
+ * reads and writes them. Run it yourself, with the administrator's
  * connection in ADMIN_DATABASE_URL (in .env.local, never committed):
  *
  *   pnpm provision-site atelier
